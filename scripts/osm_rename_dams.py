@@ -15,7 +15,7 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-ROOT = Path('/Users/kennyquintana/Developer/lhd-screening')
+ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / 'data' / 'full_lhd_website.csv'
 LOG_CSV = ROOT / 'scripts' / 'osm_rename_log.csv'
 PROGRESS = ROOT / 'scripts' / 'osm_rename_progress.log'

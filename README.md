@@ -56,26 +56,40 @@ For each dam, `run_wsp_pipeline.py`:
 
 ## Setup
 
-The environment is a **micromamba** env (not conda). Create it from
-`environment.yml` (conda-forge for the GDAL/rasterio/geopandas binaries, pip
-for the rest):
+Commands in this README are written for **Anaconda PowerShell Prompt** on
+Windows. Run them one line at a time from the repo root (the folder that
+contains `environment.yml`).
 
-```bash
-micromamba create -f environment.yml
-micromamba activate lhd-environment
+Create the environment from `environment.yml` (conda-forge for the
+GDAL/rasterio/geopandas binaries, pip for the rest). This takes 10-30 minutes:
+
+```powershell
+conda env create -f environment.yml
+conda activate lhd-environment
 ```
 
-Or run any script without activating:
+Every new window starts in `(base)`, so run `conda activate lhd-environment`
+before running any script. If the environment already exists, update it
+instead:
 
-```bash
-micromamba run -n lhd-environment python backend/run_wsp_pipeline.py --help
+```powershell
+conda env update -f environment.yml --prune
 ```
+
+micromamba also works: replace `conda` with `micromamba` in the commands above.
 
 `environment.yml` does not list `pyarrow`, `scipy`, or `matplotlib`, which the
-backend imports. If you hit an `ImportError`:
+backend imports. `pyarrow` and `scipy` are installed along with `pynhd`. If you
+hit an `ImportError`, run this with the environment active:
 
-```bash
-micromamba run -n lhd-environment pip install pyarrow scipy matplotlib
+```powershell
+pip install pyarrow scipy matplotlib
+```
+
+To check that the pipeline's packages are installed:
+
+```powershell
+python -c "import geopandas, rasterio, pynhd, pyarrow, scipy, s3fs; print('OK')"
 ```
 
 `backend/requirements.txt` is a plain-pip alternative to `environment.yml`.
@@ -86,12 +100,17 @@ is needed.
 ### Credentials
 
 `backend/build_nwm_fdc.py` pulls National Water Model (NWM) percentile flows
-from the CIROH NWM API v2 and needs an API key. Set `NWM_API_KEY` in your
-environment, or add this line to a `.env` file at the repo root (it is
-gitignored):
+from the CIROH NWM API v2 and needs an API key. Add this line to a `.env` file
+at the repo root (it is gitignored):
 
 ```
 NWM_API_KEY=your_key_here
+```
+
+Or set it for the current window only:
+
+```powershell
+$env:NWM_API_KEY = "your_key_here"
 ```
 
 ## Data sources
@@ -109,7 +128,10 @@ NWM_API_KEY=your_key_here
 
 ### One-time prep (run in order)
 
-```bash
+The master CSV and the JSON files in the repo already include the output of
+these steps. Only rerun them when the dam list changes.
+
+```powershell
 # 1. HUC codes for every dam (overwrites HUC2/HUC4/HUC6/HUC8 in the master CSV)
 python backend/assign_huc8.py
 
@@ -145,12 +167,23 @@ one bundle per group at `<staging-root>/huc6_<KEY>/`. For each batch it:
 6. Aggregates results into the master CSV and recomputes the danger range
    (also runs when the disk gate halts the loop).
 
-```bash
-python backend/run_wsp_pipeline.py \
-    --local-staging-root /path/to/staging \
-    --existing-data-dir  /old/lhd_staging \
-    --huc-level 6
+Create a working folder outside OneDrive (it grows to hundreds of GB), then
+run the pipeline:
+
+```powershell
+mkdir C:\lhd_staging
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging
 ```
+
+To process only one HUC6, add `--huc` with all 6 digits, including leading
+zeros:
+
+```powershell
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --huc 011000
+```
+
+Press **Ctrl+C** to stop. Running the same command again resumes: finished
+batches are skipped and an interrupted batch picks up where it left off.
 
 Common flags:
 
@@ -168,7 +201,9 @@ Common flags:
 
 `--existing-data-dir` symlinks already-staged per-dam `DEM/` and `STRM/`
 folders (including trees from the archived ARC pipeline) into the new bundle,
-so reruns don't refetch DEMs.
+so reruns don't refetch DEMs. On Windows, creating symlinks requires
+Developer Mode (**Settings → System → For developers**) or an administrator
+window. Without it, the pipeline skips the reuse and downloads the DEMs again.
 
 Dams with a `Review_Status` of `Removed`, `Confirmed not a LHD`, or `Appears
 to not be LHD` are skipped.
@@ -203,20 +238,22 @@ length changes, its `Qmin_env` / `Qmax_env` are cleared so they get recomputed.
 
 To refresh manually:
 
-```bash
-python backend/run_wsp_pipeline.py --local-staging-root /path/to/staging --aggregate
-python backend/compute_wsp_danger_range.py            # add --dry-run to preview
+```powershell
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --aggregate
+python backend/compute_wsp_danger_range.py
 ```
+
+Add `--dry-run` to the second command to preview without writing.
 
 ### Disk gate and archiving
 
 When free disk drops below `--min-free-gb`, the loop halts cleanly. To clear
-the queue in one shot:
+the queue in one shot, moving finished bundles to another drive (here `E:`; the
+destination folder must already exist):
 
-```bash
-python backend/run_wsp_pipeline.py \
-    --local-staging-root /path/to/staging \
-    --archive-to /Volumes/ExternalDrive
+```powershell
+mkdir E:\lhd_archive
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --archive-to E:\lhd_archive
 ```
 
 `--archive-to` consolidates symlinks into real files, prunes raw tiles, moves
@@ -225,22 +262,28 @@ to `archived`. Add `--include-partial` to move `partial` bundles too.
 
 ### Other commands
 
-```bash
+```powershell
 # inspect the ledger
-python backend/run_wsp_pipeline.py --local-staging-root /path --status
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --status
 
 # find the batch a specific dam belongs to
-python backend/run_wsp_pipeline.py --local-staging-root /path --locate 1234
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --locate 1234
 
 # per-key manual archive (rare; --archive-to handles the queue)
-python backend/run_wsp_pipeline.py --local-staging-root /path --consolidate 140600
-python backend/run_wsp_pipeline.py --local-staging-root /path --mark-archived 140600
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --consolidate 140600
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --mark-archived 140600
 
 # reclaim disk by deleting raw 3DEP tiles from every bundle
-python backend/run_wsp_pipeline.py --local-staging-root /path --prune-raw-all
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --prune-raw-all
 
 # move archived bundles back (single key, comma list, or "all")
-python backend/run_wsp_pipeline.py --local-staging-root /path --restore 140600
+python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --restore 140600
+```
+
+To list every HUC6 code with its number of dams (largest first):
+
+```powershell
+python -c "import pandas as pd; d=pd.read_csv('data/full_lhd_website.csv',dtype={'HUC8':str},encoding='latin-1',low_memory=False); print(d['HUC8'].str.split('.').str[0].str.zfill(8).str[:6].value_counts().to_string())"
 ```
 
 ### Failures and diagnostics
@@ -253,14 +296,14 @@ one of:
 `profile_error:<msg>`, `insufficient_dem_coverage`, `negative_delta_wse`,
 `no_tw_bf`, `no_solution`, `exception:<msg>`.
 
-```bash
+```powershell
 # summarize all failures into a CSV
-python backend/diagnose_wsp_failures.py --staging-root /path/to/staging --failures-only
+python backend/diagnose_wsp_failures.py --staging-root C:\lhd_staging --failures-only
 
 # preview, relabel, or delete cached failures so they get retried
-python backend/reset_wsp_cache.py --staging-root /path/to/staging --dry-run
-python backend/reset_wsp_cache.py --staging-root /path/to/staging --relabel api_fail
-python backend/reset_wsp_cache.py --staging-root /path/to/staging --delete
+python backend/reset_wsp_cache.py --staging-root C:\lhd_staging --dry-run
+python backend/reset_wsp_cache.py --staging-root C:\lhd_staging --relabel api_fail
+python backend/reset_wsp_cache.py --staging-root C:\lhd_staging --delete
 
 # compare WSP height/length against NID reference values
 python backend/analyze_wsp_predictions.py
@@ -268,9 +311,8 @@ python backend/analyze_wsp_predictions.py
 
 ### Debugging a single dam
 
-```bash
-python backend/test_nhd_wsp.py \
-    --dam-id 1234 --lat 40.123 --lon -111.456 --comid 9876543
+```powershell
+python backend/test_nhd_wsp.py --dam-id 1234 --lat 40.123 --lon -111.456 --comid 9876543
 ```
 
 Downloads whatever is missing. Use `--Q` to override the discharge (default is
@@ -280,21 +322,23 @@ widen the upstream search window.
 ## Frontend
 
 Static site, no build step. The map loads `data/full_lhd_website.csv`,
-`data/fdc/<comid>.json`, and `data/src/<comid>.json` by relative URL. Create
-the CSV symlink once for local dev (it is gitignored):
+`data/fdc/<comid>.json`, and `data/src/<comid>.json` by relative URL. For
+local dev, copy the master CSV into `frontend/data/` (the copy is gitignored).
+Copy it again whenever the master CSV changes:
 
-```bash
-ln -s ../../data/full_lhd_website.csv frontend/data/full_lhd_website.csv
+```powershell
+Copy-Item data\full_lhd_website.csv frontend\data\full_lhd_website.csv
 ```
 
-On Windows without symlink rights, copy the file to
-`frontend/data/full_lhd_website.csv` instead. Then serve it:
+Then serve the site:
 
-```bash
-cd frontend && python -m http.server 8000
+```powershell
+cd frontend
+python -m http.server 8000
 ```
 
-Open <http://localhost:8000>. Dams in Hawaii and Puerto Rico are excluded
+Open <http://localhost:8000>. Press **Ctrl+C** to stop the server, then run
+`cd ..` to return to the repo root. Dams in Hawaii and Puerto Rico are excluded
 because the National Water Model (NWM) does not produce forecasts there.
 
 Live forecasts come from the NOAA National Water Prediction Service API

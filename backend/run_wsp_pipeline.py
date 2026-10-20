@@ -904,17 +904,33 @@ def _cmd_aggregate(args: argparse.Namespace) -> None:
     print(f"  {len(rows)} dams with ok results")
 
     dams = pd.read_csv(dams_csv, low_memory=False, encoding="latin-1")
-    for col in ("Dam_Height_WSP_Ft", "Dam_Length_WSP_Ft",
-                "WSP_Q_cms", "WSP_delta_wse_m", "WSP_upstream_comid"):
-        if col in dams.columns:
-            dams = dams.drop(columns=[col])
+    wsp_cols = ["Dam_Height_WSP_Ft", "Dam_Length_WSP_Ft",
+                "WSP_Q_cms", "WSP_delta_wse_m", "WSP_upstream_comid"]
+    for col in wsp_cols + ["Qmin_env", "Qmax_env"]:
+        if col not in dams.columns:
+            dams[col] = np.nan
 
-    add = pd.DataFrame.from_dict(rows, orient="index")
-    add.index.name = "OBJECTID"
-    add = add.reset_index()
-    merged = dams.merge(add, on="OBJECTID", how="left")
-    merged.to_csv(dams_csv, index=False)
-    print(f"Wrote Dam_Height_WSP_Ft / Dam_Length_WSP_Ft (+ 3 diagnostic cols) to {dams_csv}")
+    # Update only the dams that have a result in the scanned folders. Every
+    # other dam keeps its existing values, so results from bundles archived to
+    # another drive, or HUCs run on another computer, are not wiped.
+    oid = pd.to_numeric(dams["OBJECTID"], errors="coerce")
+    hit = oid.isin(list(rows))
+    geom_cols = ["Dam_Height_WSP_Ft", "Dam_Length_WSP_Ft"]
+    before = dams.loc[hit, geom_cols].copy()
+    for col in wsp_cols:
+        dams.loc[hit, col] = [rows[int(i)][col] for i in oid[hit]]
+
+    # If a dam's height or length changed, clear its danger range so
+    # compute_wsp_danger_range (which skips dams that already have Qmin_env)
+    # recomputes it from the new geometry.
+    changed = (before != dams.loc[hit, geom_cols]).any(axis=1)
+    stale = changed[changed].index
+    dams.loc[stale, ["Qmin_env", "Qmax_env"]] = np.nan
+
+    dams.to_csv(dams_csv, index=False)
+    kept = int((~hit & dams["Dam_Height_WSP_Ft"].notna()).sum())
+    print(f"Updated {int(hit.sum())} dams in {dams_csv} "
+          f"({len(stale)} with new geometry; {kept} other dams kept as-is)")
 
 
 def _cmd_locate(args: argparse.Namespace) -> None:

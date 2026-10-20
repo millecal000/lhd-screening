@@ -195,6 +195,12 @@ batches are retried automatically.
 already have `Qmin_env` are skipped. It writes to both `data/` and
 `frontend/data/` copies of the CSV.
 
+The aggregate step only updates dams that have a `wsp_result.json` under
+`--local-staging-root` (or an `--existing-data-dir`). Every other dam keeps
+its current values, so archiving bundles to another drive or running HUCs on
+different computers does not erase earlier results. When a dam's height or
+length changes, its `Qmin_env` / `Qmax_env` are cleared so they get recomputed.
+
 To refresh manually:
 
 ```bash

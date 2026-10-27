@@ -56,10 +56,10 @@ def _save_failures(staging_dir: Path, failures: Dict[int, dict]) -> None:
     tmp.write_text(json.dumps(out, indent=2))
     tmp.replace(p)
 
-try:
-    import gdal
-except ImportError:
-    from osgeo import gdal
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.merge import merge as rio_merge
+from rasterio.warp import transform_bounds
 
 _BACKEND_ROOT = Path(__file__).resolve().parent
 if str(_BACKEND_ROOT) not in sys.path:
@@ -68,6 +68,27 @@ if str(_BACKEND_ROOT) not in sys.path:
 from lhd_processor.land_raster import make_constant_land_raster
 
 _X_SECTION_DIST_M = 500.0
+
+
+def _mosaic_and_clip(tile_paths: List[str], bbox_wgs84, out_path: Path) -> None:
+    """Mosaic DEM tiles and clip to a WGS84 bbox, keeping the tiles' CRS."""
+    with rasterio.open(tile_paths[0]) as first:
+        src_crs = first.crs
+        profile = first.profile
+    bounds = transform_bounds("EPSG:4326", src_crs, *bbox_wgs84, densify_pts=21)
+    data, transform = rio_merge(tile_paths, bounds=bounds, resampling=Resampling.bilinear)
+    profile.update(
+        driver="GTiff",
+        height=data.shape[1],
+        width=data.shape[2],
+        count=data.shape[0],
+        transform=transform,
+        compress="lzw",
+    )
+    for key in ("blockxsize", "blockysize", "tiled"):
+        profile.pop(key, None)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(data)
 
 _print_lock = threading.Lock()
 
@@ -160,15 +181,7 @@ def _build_one(
 
     site_dem_dir.mkdir(parents=True, exist_ok=True)
     try:
-        gdal.Warp(
-            str(dem_path),
-            tile_paths,
-            outputBounds=bbox,
-            outputBoundsSRS="EPSG:4326",
-            resampleAlg=gdal.GRA_Bilinear,
-            format="GTiff",
-            creationOptions=["COMPRESS=LZW"],
-        )
+        _mosaic_and_clip(tile_paths, bbox, dem_path)
     except Exception as e:
         _log(f"[{idx}/{total}] Dam {dam_id}: FAIL warp ({e})")
         return dam_id, f"warp-error:{e}"

@@ -82,10 +82,8 @@ def _lookup_comid_direct(lon: float, lat: float, timeout: float = 30) -> Optiona
     except (TypeError, ValueError):
         return None
 
-try:
-    import gdal
-except ImportError:
-    from osgeo import gdal
+from rasterio.merge import merge as rio_merge
+from rasterio.warp import Resampling, reproject
 
 
 def sanitize_filename(filename):
@@ -447,8 +445,8 @@ def download_land_raster(lhd_id: int, dem_path: str, land_dir: str):
 
     # Get target DEM specs
     with rasterio.open(dem_path) as src:
-        bounds = [src.bounds.left, src.bounds.top, src.bounds.right, src.bounds.bottom]
         ncols, nrows = src.width, src.height
+        dem_transform = src.transform
         dem_crs = src.crs
         # Create polygon for ESA intersection
         geom = box(*src.bounds)
@@ -458,17 +456,22 @@ def download_land_raster(lhd_id: int, dem_path: str, land_dir: str):
     raw_lc_tif = _download_esa_land_cover(geom, raw_esa_dir, dem_crs)
 
     if raw_lc_tif:
-        # Align using GDAL Warp to ensure exact grid match
-        options = gdal.WarpOptions(
-            format='GTiff',
-            outputBounds=bounds,
-            width=ncols,
-            height=nrows,
-            dstSRS=dem_crs.to_wkt(),
-            resampleAlg=gdal.GRA_NearestNeighbour,
-            creationOptions=['COMPRESS=LZW']
-        )
-        gdal.Warp(final_path, raw_lc_tif, options=options)
+        # Reproject onto the DEM's grid so the pixels line up exactly
+        with rasterio.open(raw_lc_tif) as src:
+            profile = src.profile
+            profile.update(driver='GTiff', crs=dem_crs, transform=dem_transform,
+                           width=ncols, height=nrows, compress='lzw')
+            for key in ('blockxsize', 'blockysize', 'tiled'):
+                profile.pop(key, None)
+            with rasterio.open(final_path, 'w', **profile) as dst:
+                for band in range(1, src.count + 1):
+                    reproject(
+                        source=rasterio.band(src, band),
+                        destination=rasterio.band(dst, band),
+                        dst_transform=dem_transform,
+                        dst_crs=dem_crs,
+                        resampling=Resampling.nearest,
+                    )
         return final_path
     return None
 
@@ -517,7 +520,18 @@ def _download_esa_land_cover(geom, output_dir, dem_crs, year=2021):
 
     merged_path = os.path.join(output_dir, "merged_esa.tif")
     try:
-        gdal.Warp(merged_path, downloaded, options=gdal.WarpOptions(format='GTiff', creationOptions=['COMPRESS=LZW']))
+        # Only read the site's window (plus a small pad) — full ESA tiles are ~1 GB each
+        pad = 0.01
+        minx, miny, maxx, maxy = geom_wgs84.bounds
+        data, transform = rio_merge(downloaded, bounds=(minx - pad, miny - pad, maxx + pad, maxy + pad))
+        with rasterio.open(downloaded[0]) as first:
+            profile = first.profile
+        profile.update(driver='GTiff', height=data.shape[1], width=data.shape[2],
+                       count=data.shape[0], transform=transform, compress='lzw')
+        for key in ('blockxsize', 'blockysize', 'tiled'):
+            profile.pop(key, None)
+        with rasterio.open(merged_path, 'w', **profile) as dst:
+            dst.write(data)
         return merged_path
     except Exception as e:
         print(f"Error merging ESA tiles: {e}")

@@ -56,7 +56,23 @@ For each dam, `run_wsp_pipeline.py`:
 
 ## Setup
 
-Commands in this README are written for **Anaconda PowerShell Prompt** on
+### Option A: uv (recommended)
+
+No conda/mamba needed — `rasterio`, `geopandas` and `pyproj` ship pip wheels
+with GDAL and PROJ bundled. Install [uv](https://docs.astral.sh/uv/), then from
+the repo root:
+
+```bash
+uv sync                                   # creates .venv from pyproject.toml
+uv run python backend/run_wsp_pipeline.py --help
+```
+
+Prefix any command in this README with `uv run` instead of activating an
+environment (or activate `.venv` yourself).
+
+### Option B: conda / micromamba
+
+Commands in this section are written for **Anaconda PowerShell Prompt** on
 Windows. Run them one line at a time from the repo root (the folder that
 contains `environment.yml`).
 

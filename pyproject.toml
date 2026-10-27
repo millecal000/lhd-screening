@@ -1,0 +1,36 @@
+[project]
+name = "lhd-screening"
+version = "0.1.0"
+description = "Low-head dam screening pipeline"
+requires-python = ">=3.10"
+# rasterio, pyogrio (via geopandas) and pyproj ship wheels with GDAL/PROJ bundled,
+# so no system GDAL or conda env is needed.
+dependencies = [
+    # Core geospatial
+    "geopandas",
+    "rasterio",
+    "pyproj",
+    "shapely",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scipy",
+    "matplotlib",
+    "scikit-learn",
+    # NHD / hydrology
+    "pynhd",
+    "requests",
+    # Used by non-staging paths (full pipeline)
+    "s3fs",
+    "geoglows",
+    "laspy",
+    "xarray",
+    "zarr",
+]
+
+[tool.uv]
+package = false
+# geoglows -> hydrostats -> numba -> llvmlite. Newer llvmlite releases have no
+# Intel-macOS wheels; forbid source builds so uv picks a version with a wheel.
+no-build-package = ["llvmlite", "numba"]
+constraint-dependencies = ["numba<0.63; sys_platform == 'darwin' and platform_machine == 'x86_64'"]

@@ -4,7 +4,6 @@ geopandas
 shapely
 pyproj
 rasterio
-GDAL
 
 # NHD / hydrology
 pynhd

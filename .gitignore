@@ -22,3 +22,6 @@ frontend/hydrography/*.gpkg
 
 # OS
 .DS_Store
+
+# uv lockfile (not tracked for now; see issue)
+uv.lock

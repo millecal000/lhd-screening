@@ -56,8 +56,10 @@ def _save_failures(staging_dir: Path, failures: Dict[int, dict]) -> None:
     tmp.write_text(json.dumps(out, indent=2))
     tmp.replace(p)
 
+import numpy as np
 import rasterio
 from rasterio.enums import Resampling
+from rasterio.io import MemoryFile
 from rasterio.merge import merge as rio_merge
 from rasterio.warp import transform_bounds
 
@@ -70,6 +72,45 @@ from lhd_processor.land_raster import make_constant_land_raster
 _X_SECTION_DIST_M = 500.0
 
 
+def _pick_dem_compression() -> str:
+    """Use ZSTD when this rasterio build supports it, otherwise DEFLATE.
+
+    Both are lossless. ZSTD is faster and slightly smaller; DEFLATE is readable
+    by every GDAL build, so it is the safe fallback.
+    """
+    try:
+        with MemoryFile() as mem:
+            with mem.open(driver="GTiff", width=16, height=16, count=1,
+                          dtype="float32", compress="zstd",
+                          transform=rasterio.Affine(1, 0, 0, 0, -1, 16)) as test:
+                test.write(np.zeros((1, 16, 16), dtype="float32"))
+        return "zstd"
+    except Exception:
+        return "deflate"
+
+
+_DEM_COMPRESSION = _pick_dem_compression()
+
+
+def _dem_write_options(dtype: str) -> dict:
+    """GeoTIFF creation options for trimmed DEMs.
+
+    - lossless compression with a predictor (3 for floating-point elevations,
+      2 for integers), which shrinks DEMs to roughly 40% of plain LZW
+    - 512x512 internal tiles instead of one-row strips
+    - BIGTIFF=IF_SAFER so a large clip switches to BigTIFF instead of being
+      truncated at the 4 GB classic-TIFF limit
+    """
+    return {
+        "compress": _DEM_COMPRESSION,
+        "predictor": 3 if np.issubdtype(np.dtype(dtype), np.floating) else 2,
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+        "BIGTIFF": "IF_SAFER",
+    }
+
+
 def _mosaic_and_clip(tile_paths: List[str], bbox_wgs84, out_path: Path) -> None:
     """Mosaic DEM tiles and clip to a WGS84 bbox, keeping the tiles' CRS."""
     with rasterio.open(tile_paths[0]) as first:
@@ -77,16 +118,18 @@ def _mosaic_and_clip(tile_paths: List[str], bbox_wgs84, out_path: Path) -> None:
         profile = first.profile
     bounds = transform_bounds("EPSG:4326", src_crs, *bbox_wgs84, densify_pts=21)
     data, transform = rio_merge(tile_paths, bounds=bounds, resampling=Resampling.bilinear)
+    # Drop the source tiles' storage settings; the clip gets its own below.
+    for key in ("blockxsize", "blockysize", "tiled", "compress", "predictor", "interleave"):
+        profile.pop(key, None)
     profile.update(
         driver="GTiff",
         height=data.shape[1],
         width=data.shape[2],
         count=data.shape[0],
         transform=transform,
-        compress="lzw",
+        dtype=data.dtype.name,
+        **_dem_write_options(data.dtype.name),
     )
-    for key in ("blockxsize", "blockysize", "tiled"):
-        profile.pop(key, None)
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(data)
 

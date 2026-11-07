@@ -70,17 +70,50 @@ if str(_BACKEND_ROOT) not in sys.path:
 
 from lhd_processor.land_raster import make_constant_land_raster
 
+# --- Optional GDAL Python bindings --------------------------------------------
+# GDAL's own Python bindings ("osgeo") come with the conda environment
+# (environment.yml) but are not installed by `uv sync`. When they are present,
+# _mosaic_and_clip uses gdal.Warp, which is what built every DEM before the
+# 2026-10-27 switch to uv and is known to work: it reprojects tiles from
+# different UTM zones onto one grid and honours each tile's nodata value.
+# When they are absent it falls back to rasterio.merge, which has two known
+# problems (see _mosaic_and_clip_rasterio). Run DEM building in conda.
+try:
+    from osgeo import gdal as _gdal
+    _gdal.UseExceptions()  # raise Python errors instead of returning None
+except ImportError:  # uv environment: no GDAL bindings
+    _gdal = None
+
 _X_SECTION_DIST_M = 500.0
 
-# Guard against oversized flowline files. NLDI's upstreamTributaries navigation
-# occasionally returns a whole river network (hundreds of segments spread over
-# tens of km) instead of ~1 km of river. A DEM covering that area at 1 m needs
-# tens of GB of memory and can exceed the classic-TIFF 4 GB limit. When the
-# flowline bbox is wider or taller than _MAX_FLOWLINE_EXTENT_M, keep only the
-# segments within _NEAR_SEED_REACH_M of the dam's own reach (the COMID in the
-# file name). That still covers the dam reach and the reach just upstream,
-# which is all the WSP step samples. Normal-sized flowlines are unchanged.
+# --- Guard against oversized flowline files ---------------------------------
+# Each dam's DEM is clipped to the bounding box of its NHD flowline file
+# (STRM/<dam_id>/nhd_flowline_<COMID>.gpkg) plus a buffer. Normally that file
+# holds ~1 km of river upstream and ~1.5 km downstream of the dam, so the DEM
+# covers a few km^2.
+#
+# Occasionally NLDI's "upstreamTributaries" navigation returns a whole river
+# network instead: hundreds of segments spread over tens of km. Example: dams
+# 9276, 9544, 9655 and 10460 in huc6_160503 had flowline files covering
+# ~72 x 78 km. Clipping a 1 m DEM to that area means billions of pixels
+# (~22 GB of memory) and a file that hit the classic-TIFF 4 GB limit and was
+# truncated (unreadable).
+#
+# The WSP height calculation (run_wsp_pipeline._process_dam) only samples the
+# DEM along the dam's own reach and the reach directly upstream, so a DEM over
+# the whole network is never needed. When a flowline file is unusually large,
+# _flowline_bbox_wgs84 therefore sizes the DEM from the segments near the dam's
+# own reach instead (see _segments_near_seed_reach).
+
+# A flowline file whose bounding box is wider OR taller than this (in metres,
+# measured in the local UTM zone) is treated as oversized. 20 km is well above
+# any normal file (the largest normal one seen spans ~6 x 16 km), so ordinary
+# dams are never affected and their DEMs stay identical to earlier runs.
 _MAX_FLOWLINE_EXTENT_M = 20_000.0
+
+# For an oversized file, keep only segments that come within this distance (m)
+# of the dam's own reach. 3 km comfortably covers the dam reach, the reach
+# upstream of it, and the 500 m downstream search window used by the WSP step.
 _NEAR_SEED_REACH_M = 3_000.0
 
 
@@ -124,7 +157,96 @@ def _dem_write_options(dtype: str) -> dict:
 
 
 def _mosaic_and_clip(tile_paths: List[str], bbox_wgs84, out_path: Path) -> None:
-    """Mosaic DEM tiles and clip to a WGS84 bbox, keeping the tiles' CRS."""
+    """Mosaic DEM tiles and clip them to a WGS84 bbox, writing a compressed GeoTIFF.
+
+    Uses gdal.Warp when GDAL's Python bindings are installed (conda), otherwise
+    rasterio.merge (uv). Both write with _dem_write_options (lossless
+    compression, predictor, 512x512 tiles, BigTIFF safety). The method used is
+    logged once per run.
+    """
+    if _gdal is not None:
+        _log_mosaic_method_once("gdal.Warp (GDAL Python bindings)")
+        _mosaic_and_clip_gdal(tile_paths, bbox_wgs84, out_path)
+    else:
+        _log_mosaic_method_once(
+            "rasterio.merge -- WARNING: GDAL Python bindings not found. This "
+            "method fails on tiles from different UTM zones (CRS mismatch) and "
+            "writes all-zero DEMs from 1/9 arc-second .img tiles. Build DEMs "
+            "in the conda environment (environment.yml) instead."
+        )
+        _mosaic_and_clip_rasterio(tile_paths, bbox_wgs84, out_path)
+
+
+_mosaic_method_logged = False
+
+
+def _log_mosaic_method_once(method: str) -> None:
+    """Print which mosaic method is in use, the first time a DEM is built."""
+    global _mosaic_method_logged
+    if not _mosaic_method_logged:
+        _mosaic_method_logged = True
+        _log(f"DEM mosaic method: {method}")
+
+
+def _gdal_creation_options(dtype: str) -> List[str]:
+    """_dem_write_options translated into gdal.Warp creation options.
+
+    Same settings as the rasterio path, so DEMs are identical in format either
+    way: lossless ZSTD (DEFLATE if this GDAL build lacks ZSTD), predictor 3
+    for floating-point data, 512x512 internal tiles, BIGTIFF=IF_SAFER.
+    """
+    opts = _dem_write_options(dtype)
+    # The ZSTD check in _pick_dem_compression used rasterio's GDAL; check this
+    # GDAL build too, since conda's GDAL can differ from rasterio's.
+    gtiff_options = _gdal.GetDriverByName("GTiff").GetMetadataItem("DMD_CREATIONOPTIONLIST") or ""
+    compress = "ZSTD" if "ZSTD" in gtiff_options else "DEFLATE"
+    return [
+        f"COMPRESS={compress}",
+        f"PREDICTOR={opts['predictor']}",
+        "TILED=YES",
+        f"BLOCKXSIZE={opts['blockxsize']}",
+        f"BLOCKYSIZE={opts['blockysize']}",
+        f"BIGTIFF={opts['BIGTIFF']}",
+    ]
+
+
+def _mosaic_and_clip_gdal(tile_paths: List[str], bbox_wgs84, out_path: Path) -> None:
+    """gdal.Warp mosaic + clip: the pre-uv method, now with compression.
+
+    - Output grid: the first tile's CRS and resolution (gdal.Warp's default),
+      so DEMs match those built before 2026-10-27.
+    - Tiles in other CRSs (e.g. neighbouring UTM zones) are reprojected onto
+      that grid instead of being rejected.
+    - Each tile's nodata value is honoured, including the -3.4e38 used by the
+      1/9 arc-second .img tiles.
+    - outputBounds/outputBoundsSRS clip to the dam's WGS84 bbox.
+    """
+    # Read the data type from the first tile so the right predictor is chosen
+    # (3 for floating-point elevations, 2 for integers).
+    first = _gdal.Open(str(tile_paths[0]))
+    dtype = _gdal.GetDataTypeName(first.GetRasterBand(1).DataType).lower()  # e.g. "float32"
+    first = None  # close the file
+
+    _gdal.Warp(
+        str(out_path),
+        [str(p) for p in tile_paths],
+        format="GTiff",
+        outputBounds=bbox_wgs84,          # (lon_min, lat_min, lon_max, lat_max)
+        outputBoundsSRS="EPSG:4326",      # the bbox is in WGS84 degrees
+        resampleAlg="bilinear",           # same as before 2026-10-27
+        creationOptions=_gdal_creation_options(dtype),
+    )
+
+
+def _mosaic_and_clip_rasterio(tile_paths: List[str], bbox_wgs84, out_path: Path) -> None:
+    """rasterio.merge mosaic + clip (used only when GDAL bindings are missing).
+
+    Known problems, found in the 2026-11-07 rebuild test of huc6_030300:
+    - Tiles in different CRSs (e.g. UTM zones 17 and 18) raise
+      "CRS mismatch with source", so the dam gets no DEM.
+    - 1/9 arc-second .img tiles (nodata -3.4e38) come out as all zeros, so the
+      WSP step returns negative_delta_wse for those dams.
+    """
     with rasterio.open(tile_paths[0]) as first:
         src_crs = first.crs
         profile = first.profile
@@ -159,18 +281,34 @@ def _utm_epsg(lon: float, lat: float) -> int:
 
 
 def _flowline_bbox_wgs84(gpkg_path: Path, buffer_m: float) -> Tuple[float, float, float, float]:
-    """flowline.total_bounds + buffer_m, computed in the local UTM zone, returned in WGS84."""
+    """Return the area to clip this dam's DEM to, as a WGS84 bbox.
+
+    The box is the flowline's extent plus ``buffer_m`` on every side, computed
+    in the local UTM zone (so the buffer is in real metres) and converted back
+    to longitude/latitude for clipping.
+
+    Oversized flowline files (wider or taller than _MAX_FLOWLINE_EXTENT_M) are
+    trimmed first to the segments near the dam's own reach; see the comment
+    block above _MAX_FLOWLINE_EXTENT_M for why. Normal files are unchanged.
+
+    Returns (lon_min, lat_min, lon_max, lat_max).
+    """
+    # Read the flowline file and make sure it is in WGS84 (EPSG:4326) lon/lat.
     gdf = gpd.read_file(gpkg_path)
     if gdf.crs is None:
         gdf = gdf.set_crs(epsg=4326)
     elif gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
 
+    # Project to the UTM zone at the flowline's centre so distances (the size
+    # check and the buffer) are measured in metres rather than degrees.
     centroid = gdf.geometry.union_all().centroid
     utm_epsg = _utm_epsg(centroid.x, centroid.y)
     gdf_utm = gdf.to_crs(epsg=utm_epsg)
     minx, miny, maxx, maxy = gdf_utm.total_bounds
 
+    # Oversized flowline file? Shrink the box to the segments near the dam's
+    # reach so the DEM stays a sensible size. Logged so it shows up in the run.
     if max(maxx - minx, maxy - miny) > _MAX_FLOWLINE_EXTENT_M:
         trimmed = _segments_near_seed_reach(gdf_utm, gpkg_path)
         if trimmed is not None:
@@ -182,16 +320,22 @@ def _flowline_bbox_wgs84(gpkg_path: Path, buffer_m: float) -> Tuple[float, float
             )
             minx, miny, maxx, maxy = trimmed.total_bounds
         else:
+            # The dam's reach could not be identified in the file, so there is
+            # nothing safe to trim around. Keep the full extent (old behaviour)
+            # but warn, because this DEM may be very large.
             _log(
                 f"  WARN {gpkg_path.name}: flowline spans {(maxx - minx) / 1000:.1f} x "
                 f"{(maxy - miny) / 1000:.1f} km but the dam reach was not found in it; "
                 f"using the full extent"
             )
+
+    # Add the buffer (metres) on every side of the box.
     minx -= buffer_m
     miny -= buffer_m
     maxx += buffer_m
     maxy += buffer_m
 
+    # Convert the corners back to longitude/latitude for the clipping step.
     transformer = Transformer.from_crs(utm_epsg, 4326, always_xy=True)
     lon_min, lat_min = transformer.transform(minx, miny)
     lon_max, lat_max = transformer.transform(maxx, maxy)
@@ -199,27 +343,49 @@ def _flowline_bbox_wgs84(gpkg_path: Path, buffer_m: float) -> Tuple[float, float
 
 
 def _segments_near_seed_reach(gdf_utm: gpd.GeoDataFrame, gpkg_path: Path):
-    """Segments within _NEAR_SEED_REACH_M of the dam's own reach, or None.
+    """Return the flowline segments within _NEAR_SEED_REACH_M of the dam's reach.
 
-    The dam's reach is the feature whose ID matches the COMID in the file name
-    (nhd_flowline_<COMID>.gpkg). Returns None when that reach can't be found,
-    so the caller falls back to the full flowline extent.
+    The dam's own reach ("seed" reach) is the segment whose ID matches the
+    COMID in the file name: stage_nhd_dem.py saves each dam's flowline as
+    ``nhd_flowline_<COMID>.gpkg``, where COMID is the reach the dam sits on.
+
+    ``gdf_utm`` must already be in a projected (metre-based) CRS so the
+    distance below is in metres.
+
+    Returns a GeoDataFrame of the nearby segments (always including the seed
+    reach itself), or None if the seed reach can't be identified, in which case
+    the caller keeps the full extent and logs a warning.
     """
+    # 1. Read the dam's COMID from the file name, e.g. nhd_flowline_10737989.gpkg.
     m = re.search(r"nhd_flowline_(\d+)", gpkg_path.stem)
     if not m:
         return None
     seed_comid = int(m.group(1))
+
+    # 2. Find the column that holds each segment's ID. NHD sources name it
+    #    differently, so match case-insensitively against the usual names.
     cols = {c.lower(): c for c in gdf_utm.columns}
     id_col = next((cols[c] for c in ("nhdplusid", "comid", "nhdplus_comid") if c in cols), None)
     if id_col is None:
         return None
-    import pandas as pd  # already loaded by geopandas
+
+    # 3. Pick out the seed reach. IDs may be stored as text, floats or blanks,
+    #    so convert them to numbers; anything unreadable becomes NaN and simply
+    #    doesn't match.
+    import pandas as pd  # already loaded by geopandas; imported here for clarity
     ids = pd.to_numeric(gdf_utm[id_col], errors="coerce")
     seed = gdf_utm[ids == seed_comid]
     if seed.empty:
         return None
+
+    # 4. Keep every segment that touches a zone extending _NEAR_SEED_REACH_M
+    #    around the seed reach. This includes the reach upstream of the dam,
+    #    which the WSP step samples, and drops the distant parts of the network.
     zone = seed.geometry.union_all().buffer(_NEAR_SEED_REACH_M)
     near = gdf_utm[gdf_utm.geometry.intersects(zone)]
+
+    # The seed reach always intersects its own zone, so ``near`` is never empty
+    # in practice; fall back to the seed alone just in case.
     return near if not near.empty else seed
 
 

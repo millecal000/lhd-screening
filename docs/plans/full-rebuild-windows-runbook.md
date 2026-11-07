@@ -55,6 +55,26 @@ How the rewritten uv method copies `gdal.Warp`:
 
 All outputs were ZSTD, predictor 3, 512×512 tiles, with no warnings.
 
+### Retest on real data (2026-11-06, `lhd-staging\rebuild-test-uv2`, uv)
+
+The log showed `DEM mosaic method: rasterio reproject (no GDAL Python bindings; uv)`, with no `CRS mismatch` and no "Ignoring nodata value" warnings. All 60 DEMs were built (dams 3694 and 9034 included), with real elevations and ZSTD, predictor 3, 512×512 tiles.
+
+| | Archive (conda, June) | uv rebuild |
+| --- | --- | --- |
+| `ok` | 48 | 49 |
+| `negative_delta_wse` | 10 | 9 |
+| `insufficient_dem_coverage` | 2 | 2 |
+| Same status as archive | | 57 of 60 |
+| Heights within 1 cm (dams `ok` in both) | | 37 of 47 (14 identical) |
+
+- **Dam 10217:** same grid as the archive's DEM (1094 × 1021), elevations 134–247 m, max difference 4.6 mm; height 4.8216 m, identical to the archive.
+- **Dam 9034** is `negative_delta_wse` in both. Its DEM now builds; the WSP step fails on it the same way it did in June.
+- **Different flowlines (7 dams: 3601, 3602, 3616, 3638, 5009, 5448, 5472).** The archive's flowline was often a single short segment (some only 40 m long); today's download has 3–11 segments covering 1–3.5 km. This accounts for the large height changes (up to 3.3 m) and for 3602 and 3616 changing from `negative_delta_wse` to `ok`.
+- **Same flowline and tiles but a slightly shifted grid (3614, 3694, 3695, 6325, 17567).** The new DEM grid sits 0.2–0.3 m (under one pixel) from the archive's. This changes interpolated elevations by about 1–2 cm on average, and the fragile downstream-point picker (see Known issues) turns that into height changes of 0.14–2 m, plus 3614 changing from `ok` to `negative_delta_wse`. The shift appears to come from how the June conda setup and today's uv libraries convert between WGS84 and NAD83, not from the DEM code: dam 10217's flowline moved by a similar 0.2 m between June and today, yet its DEM grid matches the archive's.
+- One `NotGeoreferencedWarning` from `rasterio\warp.py` appeared once. Every checked DEM is correctly georeferenced, so it is harmless.
+
+Conclusion: uv builds correct DEMs. Differences from the archive come from newer flowlines and sub-pixel coordinate handling, amplified by the downstream picker. The full rebuild uses one environment throughout, so its results are internally consistent.
+
 ## Storage
 
 | | Amount | Notes |

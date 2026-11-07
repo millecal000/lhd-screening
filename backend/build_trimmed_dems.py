@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -70,6 +71,17 @@ if str(_BACKEND_ROOT) not in sys.path:
 from lhd_processor.land_raster import make_constant_land_raster
 
 _X_SECTION_DIST_M = 500.0
+
+# Guard against oversized flowline files. NLDI's upstreamTributaries navigation
+# occasionally returns a whole river network (hundreds of segments spread over
+# tens of km) instead of ~1 km of river. A DEM covering that area at 1 m needs
+# tens of GB of memory and can exceed the classic-TIFF 4 GB limit. When the
+# flowline bbox is wider or taller than _MAX_FLOWLINE_EXTENT_M, keep only the
+# segments within _NEAR_SEED_REACH_M of the dam's own reach (the COMID in the
+# file name). That still covers the dam reach and the reach just upstream,
+# which is all the WSP step samples. Normal-sized flowlines are unchanged.
+_MAX_FLOWLINE_EXTENT_M = 20_000.0
+_NEAR_SEED_REACH_M = 3_000.0
 
 
 def _pick_dem_compression() -> str:
@@ -158,6 +170,23 @@ def _flowline_bbox_wgs84(gpkg_path: Path, buffer_m: float) -> Tuple[float, float
     utm_epsg = _utm_epsg(centroid.x, centroid.y)
     gdf_utm = gdf.to_crs(epsg=utm_epsg)
     minx, miny, maxx, maxy = gdf_utm.total_bounds
+
+    if max(maxx - minx, maxy - miny) > _MAX_FLOWLINE_EXTENT_M:
+        trimmed = _segments_near_seed_reach(gdf_utm, gpkg_path)
+        if trimmed is not None:
+            _log(
+                f"  {gpkg_path.name}: flowline spans {(maxx - minx) / 1000:.1f} x "
+                f"{(maxy - miny) / 1000:.1f} km ({len(gdf_utm)} segments); using "
+                f"{len(trimmed)} segment(s) within {_NEAR_SEED_REACH_M / 1000:g} km "
+                f"of the dam reach"
+            )
+            minx, miny, maxx, maxy = trimmed.total_bounds
+        else:
+            _log(
+                f"  WARN {gpkg_path.name}: flowline spans {(maxx - minx) / 1000:.1f} x "
+                f"{(maxy - miny) / 1000:.1f} km but the dam reach was not found in it; "
+                f"using the full extent"
+            )
     minx -= buffer_m
     miny -= buffer_m
     maxx += buffer_m
@@ -167,6 +196,31 @@ def _flowline_bbox_wgs84(gpkg_path: Path, buffer_m: float) -> Tuple[float, float
     lon_min, lat_min = transformer.transform(minx, miny)
     lon_max, lat_max = transformer.transform(maxx, maxy)
     return lon_min, lat_min, lon_max, lat_max
+
+
+def _segments_near_seed_reach(gdf_utm: gpd.GeoDataFrame, gpkg_path: Path):
+    """Segments within _NEAR_SEED_REACH_M of the dam's own reach, or None.
+
+    The dam's reach is the feature whose ID matches the COMID in the file name
+    (nhd_flowline_<COMID>.gpkg). Returns None when that reach can't be found,
+    so the caller falls back to the full flowline extent.
+    """
+    m = re.search(r"nhd_flowline_(\d+)", gpkg_path.stem)
+    if not m:
+        return None
+    seed_comid = int(m.group(1))
+    cols = {c.lower(): c for c in gdf_utm.columns}
+    id_col = next((cols[c] for c in ("nhdplusid", "comid", "nhdplus_comid") if c in cols), None)
+    if id_col is None:
+        return None
+    import pandas as pd  # already loaded by geopandas
+    ids = pd.to_numeric(gdf_utm[id_col], errors="coerce")
+    seed = gdf_utm[ids == seed_comid]
+    if seed.empty:
+        return None
+    zone = seed.geometry.union_all().buffer(_NEAR_SEED_REACH_M)
+    near = gdf_utm[gdf_utm.geometry.intersects(zone)]
+    return near if not near.empty else seed
 
 
 def _build_one(

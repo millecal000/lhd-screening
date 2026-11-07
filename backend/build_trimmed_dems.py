@@ -61,8 +61,8 @@ import numpy as np
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.io import MemoryFile
-from rasterio.merge import merge as rio_merge
-from rasterio.warp import transform_bounds
+from rasterio.transform import from_origin
+from rasterio.warp import reproject, transform_bounds
 
 _BACKEND_ROOT = Path(__file__).resolve().parent
 if str(_BACKEND_ROOT) not in sys.path:
@@ -76,8 +76,9 @@ from lhd_processor.land_raster import make_constant_land_raster
 # _mosaic_and_clip uses gdal.Warp, which is what built every DEM before the
 # 2026-10-27 switch to uv and is known to work: it reprojects tiles from
 # different UTM zones onto one grid and honours each tile's nodata value.
-# When they are absent it falls back to rasterio.merge, which has two known
-# problems (see _mosaic_and_clip_rasterio). Run DEM building in conda.
+# When they are absent (uv) it uses _mosaic_and_clip_rasterio, which does the
+# same job with rasterio.warp.reproject. (An earlier version used
+# rasterio.merge, which broke on both of those cases; see that function.)
 try:
     from osgeo import gdal as _gdal
     _gdal.UseExceptions()  # raise Python errors instead of returning None
@@ -160,7 +161,7 @@ def _mosaic_and_clip(tile_paths: List[str], bbox_wgs84, out_path: Path) -> None:
     """Mosaic DEM tiles and clip them to a WGS84 bbox, writing a compressed GeoTIFF.
 
     Uses gdal.Warp when GDAL's Python bindings are installed (conda), otherwise
-    rasterio.merge (uv). Both write with _dem_write_options (lossless
+    an equivalent rasterio reprojection (uv). Both write with _dem_write_options (lossless
     compression, predictor, 512x512 tiles, BigTIFF safety). The method used is
     logged once per run.
     """
@@ -168,12 +169,7 @@ def _mosaic_and_clip(tile_paths: List[str], bbox_wgs84, out_path: Path) -> None:
         _log_mosaic_method_once("gdal.Warp (GDAL Python bindings)")
         _mosaic_and_clip_gdal(tile_paths, bbox_wgs84, out_path)
     else:
-        _log_mosaic_method_once(
-            "rasterio.merge -- WARNING: GDAL Python bindings not found. This "
-            "method fails on tiles from different UTM zones (CRS mismatch) and "
-            "writes all-zero DEMs from 1/9 arc-second .img tiles. Build DEMs "
-            "in the conda environment (environment.yml) instead."
-        )
+        _log_mosaic_method_once("rasterio reproject (no GDAL Python bindings; uv)")
         _mosaic_and_clip_rasterio(tile_paths, bbox_wgs84, out_path)
 
 
@@ -239,33 +235,104 @@ def _mosaic_and_clip_gdal(tile_paths: List[str], bbox_wgs84, out_path: Path) -> 
 
 
 def _mosaic_and_clip_rasterio(tile_paths: List[str], bbox_wgs84, out_path: Path) -> None:
-    """rasterio.merge mosaic + clip (used only when GDAL bindings are missing).
+    """rasterio equivalent of gdal.Warp's mosaic + clip (used under uv).
 
-    Known problems, found in the 2026-11-07 rebuild test of huc6_030300:
-    - Tiles in different CRSs (e.g. UTM zones 17 and 18) raise
-      "CRS mismatch with source", so the dam gets no DEM.
-    - 1/9 arc-second .img tiles (nodata -3.4e38) come out as all zeros, so the
-      WSP step returns negative_delta_wse for those dams.
+    Mirrors _mosaic_and_clip_gdal so DEMs are the same either way:
+
+    1. Output grid: the first tile's CRS, covering the dam's WGS84 bbox
+       transformed into that CRS, with the pixel size nudged so a whole
+       number of pixels fits the box exactly (as gdal.Warp does).
+    2. Every tile is reprojected onto that grid with bilinear resampling, so
+       tiles in other CRSs (e.g. the neighbouring UTM zone) are converted
+       rather than rejected.
+    3. Each tile's own nodata value is passed explicitly, so cells with no data
+       stay nodata and real elevations are kept.
+    4. Where tiles overlap, the later tile's valid cells overwrite the
+       earlier ones (gdal.Warp's rule); a tile's nodata never blanks out
+       data already there.
+
+    Checked against gdal.Warp on a 1 m UTM tile, two tiles in different UTM
+    zones, and a 1/9 arc-second .img tile: on the same grid, elevations are
+    identical (max difference 0.0 / 0.00007 / 0.0 m). The grid itself was
+    checked against an archived conda-built DEM (dam 3601, huc6_030300).
+
+    History: this replaced a rasterio.merge version (2026-10-27 to 2026-11-06)
+    that rejected tiles from different UTM zones ("CRS mismatch with source")
+    and wrote all-zero DEMs from 1/9 arc-second .img tiles, whose nodata value
+    (-3.4e38, the most negative float32) rasterio.merge mishandles.
     """
+    # --- 1. Output grid from the first tile --------------------------------
     with rasterio.open(tile_paths[0]) as first:
-        src_crs = first.crs
+        dst_crs = first.crs
+        res_x, res_y = first.res          # pixel size in the tile's units
+        dtype = first.dtypes[0]           # e.g. "float32"
+        dst_nodata = first.nodata
         profile = first.profile
-    bounds = transform_bounds("EPSG:4326", src_crs, *bbox_wgs84, densify_pts=21)
-    data, transform = rio_merge(tile_paths, bounds=bounds, resampling=Resampling.bilinear)
-    # Drop the source tiles' storage settings; the clip gets its own below.
+
+    # Fall back to a conventional nodata value if the first tile has none.
+    if dst_nodata is None:
+        dst_nodata = -999999.0
+
+    # Transform the dam's WGS84 bbox into the output CRS as a full envelope
+    # (the box's edges are densified, because a lat/lon box is slightly tilted
+    # in UTM), then size the grid from it. This is what the conda GDAL that
+    # built the archive did: for dam 3601 (huc6_030300) it reproduces the
+    # archived DEM's 1110.67 m x 1416.30 m extent and 1111 x 1416 pixels.
+    # (Older GDAL, e.g. 3.8, transformed only two corners: ~7% narrower.)
+    minx, miny, maxx, maxy = transform_bounds(
+        "EPSG:4326", dst_crs, *bbox_wgs84, densify_pts=21
+    )
+    width = max(1, int(round((maxx - minx) / res_x)))
+    height = max(1, int(round((maxy - miny) / res_y)))
+    # Like gdal.Warp, keep the box edges exact and let the pixel size stretch
+    # very slightly (e.g. 1.0003 m instead of 1 m) so a whole number of
+    # pixels fits the box.
+    res_x = (maxx - minx) / width
+    res_y = (maxy - miny) / height
+    dst_transform = from_origin(minx, maxy, res_x, res_y)
+
+    # Start with every cell set to nodata.
+    mosaic = np.full((height, width), dst_nodata, dtype=dtype)
+
+    # --- 2-4. Reproject each tile onto the grid ----------------------------
+    for path in tile_paths:
+        with rasterio.open(path) as src:
+            # This tile on the output grid; cells it doesn't cover stay nodata.
+            part = np.full((height, width), dst_nodata, dtype=dtype)
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=part,
+                src_nodata=src.nodata,          # the tile's own nodata value
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                dst_nodata=dst_nodata,
+                resampling=Resampling.bilinear,  # same as gdal.Warp before
+            )
+        # Copy in only cells this tile actually has data for. Where tiles
+        # overlap, the later tile overwrites the earlier one -- the same rule
+        # gdal.Warp uses, so overlap strips get identical values either way.
+        has_data = part != dst_nodata
+        if np.issubdtype(part.dtype, np.floating):
+            has_data &= np.isfinite(part)
+        mosaic[has_data] = part[has_data]
+
+    # --- Write with the standard compressed DEM settings --------------------
+    # Drop the source tile's storage settings; the clip gets its own below.
     for key in ("blockxsize", "blockysize", "tiled", "compress", "predictor", "interleave"):
         profile.pop(key, None)
     profile.update(
         driver="GTiff",
-        height=data.shape[1],
-        width=data.shape[2],
-        count=data.shape[0],
-        transform=transform,
-        dtype=data.dtype.name,
-        **_dem_write_options(data.dtype.name),
+        height=height,
+        width=width,
+        count=1,
+        crs=dst_crs,
+        transform=dst_transform,
+        dtype=dtype,
+        nodata=dst_nodata,
+        **_dem_write_options(dtype),
     )
     with rasterio.open(out_path, "w", **profile) as dst:
-        dst.write(data)
+        dst.write(mosaic, 1)
 
 _print_lock = threading.Lock()
 

@@ -1,9 +1,9 @@
 """Rename generic LHD dam entries from OSM-named dams/weirs within RADIUS_M.
 
-Adds (or refreshes) an `OSM_Name` column on full_lhd_website.csv.
+Adds (or refreshes) an `OSM_Name` column on data/full_lhd_website.parquet.
 Queries Overpass in ~3deg tiles and caches each tile to disk so a kill/restart resumes.
 """
-import csv
+import csv  # still used for the rename log (osm_rename_log.csv)
 import json
 import math
 import re
@@ -15,8 +15,14 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
+import pandas as pd
+
+# Make backend/ importable so this script uses the shared dam-table module.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table, write_dam_table  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / 'data' / 'full_lhd_website.csv'
+SRC = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 LOG_CSV = ROOT / 'scripts' / 'osm_rename_log.csv'
 PROGRESS = ROOT / 'scripts' / 'osm_rename_progress.log'
 CACHE_DIR = ROOT / 'cache' / 'osm_dams'
@@ -89,10 +95,11 @@ def fetch_overpass(s, w, n, e, attempts_per_mirror=2):
 def main():
     PROGRESS.write_text('')
     log(f'reading {SRC}')
-    with open(SRC, newline='') as f:
-        rows = list(csv.reader(f))
-    header = rows[0]
-    data = rows[1:]
+    # The matching code below works on rows of text, as csv.reader gave them.
+    # read_dam_table(as_str=True) gives text cells; missing cells become "".
+    df = read_dam_table(SRC, as_str=True)
+    header = list(df.columns)
+    data = df.astype(object).where(df.notna(), '').values.tolist()
     i_oid = header.index('OBJECTID')
     i_la = header.index('Latitude')
     i_lo = header.index('Longitude')
@@ -201,10 +208,9 @@ def main():
         for i, row in enumerate(data):
             row.append(osm_name_per_row.get(i, ''))
 
-    with open(SRC, 'w', newline='') as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        w.writerows(data)
+    # Back to a table; write_dam_table restores the CSV-era column types
+    # ("" -> missing, all-number columns -> numbers).
+    write_dam_table(pd.DataFrame(data, columns=header), SRC)
     log(f'wrote OSM_Name column to {SRC}')
 
     with open(LOG_CSV, 'w', newline='') as f:

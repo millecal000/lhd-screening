@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-One-time script to enrich full_lhd_website.csv with GNIS_Name from NHDPlus.
+One-time script to enrich data/full_lhd_website.parquet with GNIS_Name from NHDPlus.
 
 Adds a GNIS_Name column by finding the nearest NHDPlus flowline for each dam.
 Two modes:
@@ -30,7 +30,11 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry import box
 
-CSV_DEFAULT = Path(__file__).resolve().parent.parent / "data" / "full_lhd_website.csv"
+# Make backend/ importable so this script uses the shared dam-table module.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table, write_dam_table  # noqa: E402
+
+TABLE_DEFAULT = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 
 # Nearest-neighbor search radius in degrees (~2 km at mid-latitudes).
 # Dams further than this from any NHDPlus flowline will get an empty GNIS_Name.
@@ -150,22 +154,24 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--csv", type=Path, default=CSV_DEFAULT,
-                        help="Path to full_lhd_website.csv (default: %(default)s)")
+    # --csv is kept as an old alias of --table.
+    parser.add_argument("--table", "--csv", dest="table", type=Path, default=TABLE_DEFAULT,
+                        help="Path to full_lhd_website.parquet (default: %(default)s)")
     parser.add_argument("--nhd-file", type=Path, default=None,
                         help="Local NHDPlus GeoPackage or shapefile (use instead of API)")
     parser.add_argument("--out", type=Path, default=None,
-                        help="Output CSV path (default: overwrite input)")
+                        help="Output .parquet path (default: overwrite input)")
     args = parser.parse_args()
 
-    csv_path: Path = args.csv
-    out_path: Path = args.out or csv_path
+    table_path: Path = args.table
+    out_path: Path = args.out or table_path
 
-    if not csv_path.exists():
-        sys.exit(f"ERROR: CSV not found at {csv_path}")
+    if not table_path.exists():
+        sys.exit(f"ERROR: dam table not found at {table_path}")
 
-    print(f"Loading {csv_path} …")
-    df = pd.read_csv(csv_path, dtype=str)
+    print(f"Loading {table_path} …")
+    # as_str=True: every cell as text, as the old read_csv(dtype=str) gave it.
+    df = read_dam_table(table_path, as_str=True)
     print(f"  {len(df):,} rows")
 
     # Build GeoDataFrame for dams with valid coordinates
@@ -191,7 +197,8 @@ def main() -> None:
     df.loc[valid_mask, "GNIS_Name"] = gnis_values
     df = df.drop(columns=["_lat", "_lng"])
 
-    df.to_csv(out_path, index=False)
+    # write_dam_table turns the text back into the CSV-era column types.
+    write_dam_table(df, out_path)
 
     n_enriched = (df["GNIS_Name"].str.strip() != "").sum()
     print(f"\nDone — {n_enriched:,}/{len(df):,} dams now have GNIS_Name")

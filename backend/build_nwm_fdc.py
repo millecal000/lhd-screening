@@ -36,12 +36,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Master dam table (Parquet) reader shared by every script.
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table
 import requests
 
 _BACKEND_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT    = _BACKEND_ROOT.parent
 
-DEFAULT_CSV = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_TABLE = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 DEFAULT_OUT = _REPO_ROOT / "frontend" / "data" / "nwm_fdc.json"
 NWM_API_BASE = "https://nwm-api-v2-9f6idmxh.uc.gateway.dev"
 
@@ -114,7 +117,9 @@ def _fetch_batch(comids: list[int], api_key: str, retries: int = 3) -> dict[str,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv",        type=Path, default=DEFAULT_CSV)
+    # --csv is kept as an old alias of --table so existing commands still parse.
+    ap.add_argument("--table", "--csv", dest="table", type=Path, default=DEFAULT_TABLE,
+                    help="Master dam table (.parquet) [default: data/full_lhd_website.parquet]")
     ap.add_argument("--out",        type=Path, default=DEFAULT_OUT)
     ap.add_argument("--split-dir",  type=Path,
                     default=DEFAULT_OUT.parent / "fdc",
@@ -130,8 +135,8 @@ def main() -> int:
         print("ERROR: NWM_API_KEY not set. Add it to .env or environment.", file=sys.stderr)
         return 1
 
-    print(f"Loading {args.csv} …", flush=True)
-    df = pd.read_csv(args.csv, low_memory=False)
+    print(f"Loading {args.table} …", flush=True)
+    df = read_dam_table(args.table, columns=["Reach_ID"])  # only Reach_ID is used
     comids = (
         pd.to_numeric(df["Reach_ID"], errors="coerce")
         .dropna().astype(int)

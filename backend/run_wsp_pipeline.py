@@ -4,7 +4,7 @@ HUC-batched NHD-WSP geometry pipeline (ARC-free replacement branch).
 Same HUC batching, ledger, symlink-reuse, and file layout as rolling_pipeline.py.
 Replaces the ARC steps with in-process DEM-profile sampling + energy balance.
 
-For each HUC group in data/full_lhd_website.csv:
+For each HUC group in the dam table (data/full_lhd_website.parquet):
   1. Free-space gate — same as rolling_pipeline.py.
   2. Symlink existing DEM/STRM data from --existing-data-dir (reuses ARC-pipeline
      staging trees without copying).
@@ -39,7 +39,9 @@ Other flags
     --existing-data-dir P   reuse DEM/STRM from this staging tree (repeatable)
     --reverse               walk HUC keys from highest down (lets two instances run in parallel)
     --status                print ledger and exit
-    --aggregate             roll WSP_RESULTS into Dam_Height_WSP_Ft / Dam_Length_WSP_Ft on master CSV
+    --aggregate             roll WSP_RESULTS into Dam_Height_WSP_Ft / Dam_Length_WSP_Ft on the dam table
+    --dams-table PATH       dam table to read and update (.parquet; default data/full_lhd_website.parquet;
+                            --dams-csv is accepted as an older name for this option)
     --locate DAM_ID         print HUC batch for a dam and exit
     --consolidate KEY       replace symlinks with real files for a bundle
     --mark-archived KEY     flip ledger status to archived
@@ -76,12 +78,14 @@ from screening.wsp import (
 from compute_wsp_danger_range import run as _run_wsp_danger_range
 from lhd_processor.hydraulics import solve_weir_geom
 from stage_nhd_dem import load_vaa_df, run_stage as run_stage_nhd_dem
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table, write_dam_table
 
 import geopandas as gpd
 import pynhd as nhd
 
 _REPO_ROOT     = _BACKEND_ROOT.parent
-DEFAULT_CSV    = _REPO_ROOT / "data" / "full_lhd_website.csv"
+# The dam table is a Parquet file (see lhd_processor/dam_table.py for why).
+DEFAULT_TABLE  = DEFAULT_DAM_TABLE
 DEFAULT_FDC    = _REPO_ROOT / "frontend" / "data" / "nwm_fdc.json"
 DEFAULT_SRC    = _REPO_ROOT / "frontend" / "data" / "synthetic_rating_curves.json"
 _PARQUET_URL   = "lynker-spatial/tabular/riverml_channel_geometry_with_ahg.parquet"
@@ -566,8 +570,9 @@ def _process_huc(
     label = f"HUC{len(key)} {key}"
     huc_dir = local_root / _huc_dirname(key)
     huc_dir.mkdir(parents=True, exist_ok=True)
-    dams_csv = huc_dir / "dams.csv"
-    dams_subset.drop(columns=["_GROUP"], errors="ignore").to_csv(dams_csv, index=False)
+    # This watershed's dams, as its own small Parquet table.
+    huc_table = huc_dir / "dams.parquet"
+    write_dam_table(dams_subset.drop(columns=["_GROUP"], errors="ignore"), huc_table)
     dam_ids = [int(x) for x in dams_subset["OBJECTID"].tolist()]
 
     entry = ledger.setdefault(key, {})
@@ -607,24 +612,26 @@ def _process_huc(
         print(f"  {n_dem_cached} pending dams already have trimmed DEMs — skipping staging.")
 
     if needs_staging_ids:
-        stage_csv = huc_dir / "dams_needs_staging.csv"
-        dams_subset[dams_subset["OBJECTID"].astype(int).isin(needs_staging_ids)] \
-            .drop(columns=["_GROUP"], errors="ignore") \
-            .to_csv(stage_csv, index=False, encoding="latin-1")
+        stage_table = huc_dir / "dams_needs_staging.parquet"
+        write_dam_table(
+            dams_subset[dams_subset["OBJECTID"].astype(int).isin(needs_staging_ids)]
+            .drop(columns=["_GROUP"], errors="ignore"),
+            stage_table,
+        )
     elif pending_ids:
-        stage_csv = None  # all pending dams have DEMs; skip staging entirely
+        stage_table = None  # all pending dams have DEMs; skip staging entirely
     else:
-        stage_csv = dams_csv
+        stage_table = huc_table
 
-    stage_args = ["--staging-dir", str(huc_dir), "--dams-csv", str(stage_csv),
+    stage_args = ["--staging-dir", str(huc_dir), "--dams-table", str(stage_table),
                   "--workers", str(workers), "--download-workers", str(workers)]
 
-    if stage_csv is not None:
+    if stage_table is not None:
         # stage_nhd_dem — in-process if vaa_df already loaded, else subprocess
         if vaa_df is not None:
             print(f"\n  → stage_nhd_dem (in-process, {len(needs_staging_ids)} dams)")
             run_stage_nhd_dem(
-                staging_dir=huc_dir, dams_csv=stage_csv,
+                staging_dir=huc_dir, dams_table=stage_table,
                 workers=workers, download_workers=workers, vaa_df=vaa_df,
             )
         else:
@@ -685,7 +692,7 @@ def _process_huc(
 
 def _update_csv(args: argparse.Namespace, src_dict: Dict[str, dict] | None = None) -> None:
     """Aggregate WSP geometry into the CSV, then compute NWM danger ranges."""
-    print("\nAggregating WSP geometry into master CSV …")
+    print("\nAggregating WSP geometry into the dam table …")
     try:
         _cmd_aggregate(args)
     except Exception as e:
@@ -693,7 +700,7 @@ def _update_csv(args: argparse.Namespace, src_dict: Dict[str, dict] | None = Non
 
     print("Computing NWM danger ranges …")
     try:
-        _run_wsp_danger_range(csv_path=args.dams_csv, src_data=src_dict)
+        _run_wsp_danger_range(table_path=args.dams_table, src_data=src_dict)
     except Exception as e:
         print(f"  WARN danger range computation failed: {e}")
 
@@ -709,11 +716,12 @@ def _cmd_run(args: argparse.Namespace) -> None:
         if not d.is_dir():
             sys.exit(f"--existing-data-dir does not exist: {d}")
 
-    if not args.dams_csv.exists():
-        sys.exit(f"Dam CSV not found: {args.dams_csv}\nRun: python backend/assign_huc8.py")
-    dams = pd.read_csv(args.dams_csv, low_memory=False, encoding="latin-1")
+    if not args.dams_table.exists():
+        sys.exit(f"Dam table not found: {args.dams_table}\n"
+                 f"Convert the CSV once with scripts/convert_dam_table_to_parquet.py")
+    dams = read_dam_table(args.dams_table)
     if "HUC8" not in dams.columns:
-        sys.exit(f"{args.dams_csv} has no HUC8 column.\nRun: python backend/assign_huc8.py")
+        sys.exit(f"{args.dams_table} has no HUC8 column.\nRun: python backend/assign_huc8.py")
 
     dams = dams[
         dams["OBJECTID"].notna() & dams["Latitude"].notna() &
@@ -860,10 +868,10 @@ def _cmd_status(args: argparse.Namespace) -> None:
 
 
 def _cmd_aggregate(args: argparse.Namespace) -> None:
-    """Roll WSP_RESULTS into Dam_Height_WSP_Ft / Dam_Length_WSP_Ft on the master CSV."""
-    dams_csv: Path = args.dams_csv
-    if not dams_csv.exists():
-        sys.exit(f"Dam CSV not found: {dams_csv}")
+    """Roll WSP_RESULTS into Dam_Height_WSP_Ft / Dam_Length_WSP_Ft on the dam table."""
+    dams_table: Path = args.dams_table
+    if not dams_table.exists():
+        sys.exit(f"Dam table not found: {dams_table}")
 
     search_roots: List[Path] = [args.local_staging_root.resolve()]
     for d in (args.existing_data_dir or []):
@@ -903,7 +911,7 @@ def _cmd_aggregate(args: argparse.Namespace) -> None:
         }
     print(f"  {len(rows)} dams with ok results")
 
-    dams = pd.read_csv(dams_csv, low_memory=False, encoding="latin-1")
+    dams = read_dam_table(dams_table)
     wsp_cols = ["Dam_Height_WSP_Ft", "Dam_Length_WSP_Ft",
                 "WSP_Q_cms", "WSP_delta_wse_m", "WSP_upstream_comid"]
     for col in wsp_cols + ["Qmin_env", "Qmax_env"]:
@@ -927,18 +935,18 @@ def _cmd_aggregate(args: argparse.Namespace) -> None:
     stale = changed[changed].index
     dams.loc[stale, ["Qmin_env", "Qmax_env"]] = np.nan
 
-    dams.to_csv(dams_csv, index=False)
+    write_dam_table(dams, dams_table)
     kept = int((~hit & dams["Dam_Height_WSP_Ft"].notna()).sum())
-    print(f"Updated {int(hit.sum())} dams in {dams_csv} "
+    print(f"Updated {int(hit.sum())} dams in {dams_table} "
           f"({len(stale)} with new geometry; {kept} other dams kept as-is)")
 
 
 def _cmd_locate(args: argparse.Namespace) -> None:
     target = int(args.locate)
-    dams_csv: Path = args.dams_csv
-    if not dams_csv.exists():
-        sys.exit(f"Dam CSV not found: {dams_csv}")
-    dams = pd.read_csv(dams_csv, low_memory=False, encoding="latin-1")
+    dams_table: Path = args.dams_table
+    if not dams_table.exists():
+        sys.exit(f"Dam table not found: {dams_table}")
+    dams = read_dam_table(dams_table)
     if "HUC8" not in dams.columns:
         sys.exit("No HUC8 column — run assign_huc8.py first")
     row = dams[dams["OBJECTID"] == target]
@@ -1141,7 +1149,8 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--local-staging-root", type=Path, required=True)
-    parser.add_argument("--dams-csv", type=Path, default=DEFAULT_CSV)
+    parser.add_argument("--dams-table", "--dams-csv", dest="dams_table", type=Path, default=DEFAULT_TABLE,
+                        help="Dam table (.parquet) to read and update [default: %(default)s]")
     parser.add_argument("--huc-level", type=int, choices=[2, 4, 6, 8], default=6)
     parser.add_argument("--min-free-gb", type=float, default=200.0)
     parser.add_argument("--workers", type=int, default=8)

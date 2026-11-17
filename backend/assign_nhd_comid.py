@@ -1,5 +1,5 @@
 """
-Assign NHDPlus V2 COMID + GNIS river name to every dam in full_lhd_website.csv.
+Assign NHDPlus V2 COMID + GNIS river name to every dam in full_lhd_website.parquet.
 
 The NHDPlus V2 COMID is the feature_id used by the National Water Model, so once
 this column is populated for every dam we can swap forecast lookups from
@@ -17,7 +17,7 @@ Phase B
 
 Output
     Overwrites `Reach_ID` and adds `GNIS_Name` in
-    data/full_lhd_website.csv.
+    data/full_lhd_website.parquet.
 
 Usage
     python backend/assign_nhd_comid.py
@@ -37,6 +37,9 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+# Master dam table (Parquet) reader/writer shared by every script.
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table, write_dam_table
 import pynhd as nhd
 import requests
 from requests.adapters import HTTPAdapter
@@ -46,7 +49,7 @@ NLDI_URL = "https://labs-beta.waterdata.usgs.gov/api/nldi/linked-data/comid/posi
 
 _BACKEND_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_ROOT.parent
-DEFAULT_CSV = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_TABLE = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 DEFAULT_CHECKPOINT = _BACKEND_ROOT / "data" / "nhd_comid_checkpoint.json"
 
 _print_lock = threading.Lock()
@@ -226,7 +229,9 @@ def phase_b_lookup_gnis(comids: list[int]) -> dict[int, Optional[str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv", type=Path, default=DEFAULT_CSV, help="dam CSV to update in place")
+    # --csv is kept as an old alias of --table.
+    ap.add_argument("--table", "--csv", dest="table", type=Path, default=DEFAULT_TABLE,
+                    help="dam table (.parquet) to update in place")
     ap.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--flush-every", type=int, default=25, help="save checkpoint + log progress every N lookups")
@@ -236,12 +241,12 @@ def main() -> int:
     ap.add_argument("--phase-b-only", action="store_true", help="skip NLDI; just rebuild GNIS from checkpoint")
     args = ap.parse_args()
 
-    if not args.csv.exists():
-        _log(f"ERROR: {args.csv} not found")
+    if not args.table.exists():
+        _log(f"ERROR: {args.table} not found")
         return 1
 
-    _log(f"Loading {args.csv} ...")
-    df = pd.read_csv(args.csv, low_memory=False, encoding="latin-1")
+    _log(f"Loading {args.table} ...")
+    df = read_dam_table(args.table)
     _log(f"  {len(df)} rows")
 
     work_df = df.head(args.limit) if args.limit else df
@@ -281,8 +286,10 @@ def main() -> int:
     df.loc[touched, "GNIS_Name"] = new_gnis[touched]
     df["Reach_ID"] = pd.to_numeric(df["Reach_ID"], errors="coerce").astype("Int64")
 
-    _log(f"Writing {args.csv} ...")
-    df.to_csv(args.csv, index=False)
+    _log(f"Writing {args.table} ...")
+    # Reach_ID is Int64 here; write_dam_table stores it as the CSV did
+    # (int64 with no gaps, float64 with gaps).
+    write_dam_table(df, args.table)
     _log(
         f"Done. Reach_ID filled: {df['Reach_ID'].notna().sum()}/{len(df)}  "
         f"GNIS_Name filled: {df['GNIS_Name'].notna().sum()}/{len(df)}"

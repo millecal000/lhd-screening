@@ -1,9 +1,9 @@
 """
-Assign WBD HUC codes to every dam in full_lhd_website.csv via spatial join.
+Assign WBD HUC codes to every dam in data/full_lhd_website.parquet via spatial join.
 
 Downloads WBD_National_GPKG once into cache/wbd/ (~2.5 GB) if not present,
 loads the WBDHU8 layer, spatial-joins to dam points, and overwrites the
-HUC2/HUC4/HUC6/HUC8 columns in full_lhd_website.csv in place.  HUC2/4/6
+HUC2/HUC4/HUC6/HUC8 columns in full_lhd_website.parquet in place.  HUC2/4/6
 are derived as prefixes of the authoritative WBD HUC8.
 
 Dams that fall outside every HUC8 polygon (offshore, non-CONUS) are tagged
@@ -24,10 +24,13 @@ from urllib.request import urlretrieve
 import geopandas as gpd
 import pandas as pd
 
+# Master dam table (Parquet) reader/writer shared by every script.
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table, write_dam_table
+
 _BACKEND_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_ROOT.parent
 
-DEFAULT_DAMS_CSV = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_DAMS_TABLE = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 
 WBD_CACHE_DIR = _REPO_ROOT / "cache" / "wbd"
 WBD_ZIP_URL = (
@@ -81,8 +84,10 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--dams-csv", type=Path, default=DEFAULT_DAMS_CSV,
-                        help=f"Dam CSV to update in place (default: {DEFAULT_DAMS_CSV})")
+    # --dams-csv is kept as an old alias of --dams-table.
+    parser.add_argument("--dams-table", "--dams-csv", dest="dams_table", type=Path,
+                        default=DEFAULT_DAMS_TABLE,
+                        help=f"Dam table (.parquet) to update in place (default: {DEFAULT_DAMS_TABLE})")
     args = parser.parse_args()
 
     gpkg = _ensure_wbd_gpkg()
@@ -96,8 +101,8 @@ def main() -> None:
     huc8 = huc8[[huc_col, "geometry"]].rename(columns={huc_col: "__wbd_huc8"})
     print(f"  → {len(huc8)} HUC8 polygons (CRS = {huc8.crs})")
 
-    print(f"Loading dams from {args.dams_csv} …")
-    dams = pd.read_csv(args.dams_csv, low_memory=False, encoding="latin-1")
+    print(f"Loading dams from {args.dams_table} …")
+    dams = read_dam_table(args.dams_table)
     n_raw = len(dams)
     dams_geo = dams[dams["Latitude"].notna() & dams["Longitude"].notna()].copy()
     if len(dams_geo) < n_raw:
@@ -135,9 +140,11 @@ def main() -> None:
 
     n_missing = (dams["HUC8"] == "00000000").sum()
     unique_hucs = dams.loc[dams["HUC8"] != "00000000", "HUC8"].nunique()
-    dams.to_csv(args.dams_csv, index=False)
+    # write_dam_table stores the HUC columns with the same types the old CSV
+    # gave them on the next read (numbers), so downstream code is unchanged.
+    write_dam_table(dams, args.dams_table)
     print(
-        f"Updated {args.dams_csv} in place\n"
+        f"Updated {args.dams_table} in place\n"
         f"  {len(dams)} dams across {unique_hucs} HUC8 basins  "
         f"({n_missing} unassigned)"
     )

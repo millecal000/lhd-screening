@@ -14,7 +14,7 @@ concatenated across all discovered subdirs into a single CSV.
 Usage
 -----
     python backend/diagnose_failures.py --staging-dir /data/lhd_staging \
-        [--dams-csv data/full_lhd_website.csv] \
+        [--dams-table data/full_lhd_website.parquet] \
         [--output-csv /data/lhd_staging/diagnostics.csv]
 """
 from __future__ import annotations
@@ -28,9 +28,12 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+# Master dam table (Parquet) reader shared by every script.
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table
+
 _BACKEND_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _BACKEND_ROOT.parent
-DEFAULT_DAMS_CSV = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_DAMS_TABLE = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 
 _HUC_DIR_RE = re.compile(r"^huc\d+_")
 
@@ -421,9 +424,11 @@ def main() -> None:
     parser.add_argument("--staging-dir", required=True, type=Path,
                         help="Either a flat staging dir or a parent root with "
                              "huc<level>_<KEY>/ subdirs.")
-    parser.add_argument("--dams-csv", type=Path, default=DEFAULT_DAMS_CSV,
-                        help=f"Master dam CSV used to join HUC8 + display fields "
-                             f"(default: {DEFAULT_DAMS_CSV})")
+    # --dams-csv is kept as an old alias of --dams-table.
+    parser.add_argument("--dams-table", "--dams-csv", dest="dams_table", type=Path,
+                        default=DEFAULT_DAMS_TABLE,
+                        help=f"Master dam table (.parquet) used to join HUC8 + display fields "
+                             f"(default: {DEFAULT_DAMS_TABLE})")
     parser.add_argument("--output-csv", type=Path, default=None,
                         help="Output CSV path (default: <staging-dir>/diagnostics.csv)")
     args = parser.parse_args()
@@ -446,19 +451,21 @@ def main() -> None:
     df = pd.DataFrame(all_rows)
 
     # Join HUC8 + a friendly display column from the master CSV when available.
-    if args.dams_csv.exists():
+    if args.dams_table.exists():
         try:
-            dams = pd.read_csv(args.dams_csv, low_memory=False,
-                               usecols=lambda c: c in {
-                                   "OBJECTID", "HUC8", "Dam_Name", "OSM_Name",
-                                   "State Abbreviation", "Reach_ID",
-                               })
+            # Read only the join columns that exist in this table.
+            want = ["OBJECTID", "HUC8", "Dam_Name", "OSM_Name",
+                    "State Abbreviation", "Reach_ID"]
+            import pyarrow.parquet as _pq  # column names from the file footer
+            names = _pq.ParquetFile(args.dams_table).schema_arrow.names
+            dams = read_dam_table(args.dams_table,
+                                  columns=[c for c in want if c in names])
             dams["OBJECTID"] = pd.to_numeric(dams["OBJECTID"], errors="coerce")
             dams = dams.dropna(subset=["OBJECTID"])
             dams["OBJECTID"] = dams["OBJECTID"].astype(int)
             df = df.merge(dams, on="OBJECTID", how="left")
         except Exception as e:
-            print(f"  (master CSV join skipped: {e})")
+            print(f"  (master dam table join skipped: {e})")
 
     out_path = args.output_csv or (args.staging_dir / "diagnostics.csv")
     df.to_csv(out_path, index=False)

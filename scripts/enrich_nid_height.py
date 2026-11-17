@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enrich full_lhd_website.csv with dam dimensions from the National Inventory of Dams.
+Enrich data/full_lhd_website.parquet with dam dimensions from the National Inventory of Dams.
 
 For every dam, find its NID counterpart and copy over heights, crest length,
 and spillway width. Matching uses two methods, in priority order:
@@ -20,7 +20,7 @@ The NID national CSV (~92k dams) is downloaded once and cached locally. Use
 
     python scripts/enrich_nid_height.py                 # download + match
     python scripts/enrich_nid_height.py --radius 100    # looser match
-    python scripts/enrich_nid_height.py --out /tmp/preview.csv
+    python scripts/enrich_nid_height.py --out /tmp/preview.parquet
 
 Requirements: pandas, numpy, scikit-learn, requests
 """
@@ -34,12 +34,16 @@ import numpy as np
 import pandas as pd
 from sklearn.neighbors import BallTree
 
-CSV_DEFAULT = Path(__file__).resolve().parent.parent / "data" / "full_lhd_website.csv"
+# Make backend/ importable so this script uses the shared dam-table module.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table, write_dam_table  # noqa: E402
+
+TABLE_DEFAULT = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 NID_CACHE_DEFAULT = Path(__file__).resolve().parent.parent / "frontend" / "data" / "nid_nation.csv"
 NID_URL = "https://nid.sec.usace.army.mil/api/nation/csv"
 EARTH_RADIUS_M = 6_371_000.0
 
-# (NID source column, canonical column in full_lhd_website.csv)
+# (NID source column, canonical column in full_lhd_website.parquet)
 NID_FIELDS = [
     ("Dam Height (Ft)", "Dam_Height_Ft"),
     ("Hydraulic Height (Ft)", "Hydraulic_Height_Ft"),
@@ -76,22 +80,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--csv", type=Path, default=CSV_DEFAULT,
-                        help="Path to full_lhd_website.csv (default: %(default)s)")
+    # --csv is kept as an old alias of --table.
+    parser.add_argument("--table", "--csv", dest="table", type=Path, default=TABLE_DEFAULT,
+                        help="Path to full_lhd_website.parquet (default: %(default)s)")
     parser.add_argument("--nid-csv", type=Path, default=NID_CACHE_DEFAULT,
                         help="NID national CSV; downloaded here if missing")
     parser.add_argument("--radius", type=float, default=50.0,
                         help="Coordinate-match radius in meters (default: 50)")
     parser.add_argument("--out", type=Path, default=None,
-                        help="Output CSV path (default: overwrite input)")
+                        help="Output .parquet path (default: overwrite input)")
     args = parser.parse_args()
 
-    out_path: Path = args.out or args.csv
-    if not args.csv.exists():
-        sys.exit(f"ERROR: CSV not found at {args.csv}")
+    out_path: Path = args.out or args.table
+    if not args.table.exists():
+        sys.exit(f"ERROR: dam table not found at {args.table}")
 
-    print(f"Loading {args.csv} …")
-    df = pd.read_csv(args.csv, dtype=str, encoding="latin-1")
+    print(f"Loading {args.table} …")
+    # as_str=True: every cell as text, as the old read_csv(dtype=str) gave it.
+    df = read_dam_table(args.table, as_str=True)
     print(f"  {len(df):,} rows")
 
     nid, nid_dataset_date = load_nid(args.nid_csv)
@@ -187,7 +193,8 @@ def main() -> None:
         if method[i] and any(nid_values[c][i] for _, c in NID_FIELDS)
     )
 
-    df.to_csv(out_path, index=False)
+    # write_dam_table turns the text back into the CSV-era column types.
+    write_dam_table(df, out_path)
     print(
         f"\nDone — {n_fed:,} federal-id + {n_coord:,} coordinate matches "
         f"({n_fed + n_coord:,} total, {has_any:,} carry at least one NID value)"

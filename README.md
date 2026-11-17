@@ -6,7 +6,7 @@ Public-facing low-head dam (LHD) screening tool. It combines a Leaflet map of
 and dangerous-flow range.
 
 - **Frontend** (`frontend/`): static Leaflet map (`index.html` +
-  `mapping-logic.js` + `hydraulics.js`) that reads `data/full_lhd_website.csv`.
+  `mapping-logic.js` + `hydraulics.js`) that reads `data/full_lhd_website.parquet`.
   Color-codes dams by hazard class, exposes filters (state, owner, hazard,
   HUC), and shows per-reach National Water Model (NWM) flow-duration curves,
   synthetic rating curves, and live NWM forecasts.
@@ -213,7 +213,7 @@ Common flags:
 | `--search-up M` | `50` | Upstream flat-zone search window in meters |
 | `--existing-data-dir P` | none | Reuse DEM/STRM from an earlier staging tree (repeatable) |
 | `--reverse` | off | Walk HUC keys from highest to lowest (lets two instances run in parallel) |
-| `--dams-csv PATH` | `data/full_lhd_website.csv` | Master dam CSV |
+| `--dams-table PATH` | `data/full_lhd_website.parquet` | Master dam table (Parquet; `--dams-csv` still accepted as the old flag name) |
 
 `--existing-data-dir` symlinks already-staged per-dam `DEM/` and `STRM/`
 folders (including trees from the archived ARC pipeline) into the new bundle,
@@ -299,7 +299,7 @@ python backend/run_wsp_pipeline.py --local-staging-root C:\lhd_staging --restore
 To list every HUC6 code with its number of dams (largest first):
 
 ```powershell
-python -c "import pandas as pd; d=pd.read_csv('data/full_lhd_website.csv',dtype={'HUC8':str},encoding='latin-1',low_memory=False); print(d['HUC8'].str.split('.').str[0].str.zfill(8).str[:6].value_counts().to_string())"
+python -c "import pandas as pd; d=pd.read_parquet('data/full_lhd_website.parquet',columns=['HUC8']); print(d['HUC8'].dropna().astype('int64').astype(str).str.zfill(8).str[:6].value_counts().to_string())"
 ```
 
 ### Failures and diagnostics
@@ -337,13 +337,15 @@ widen the upstream search window.
 
 ## Frontend
 
-Static site, no build step. The map loads `data/full_lhd_website.csv`,
-`data/fdc/<comid>.json`, and `data/src/<comid>.json` by relative URL. For
-local dev, copy the master CSV into `frontend/data/` (the copy is gitignored).
-Copy it again whenever the master CSV changes:
+Static site, no build step. The map loads `data/full_lhd_website.parquet`
+(read in the browser with [hyparquet](https://github.com/hyparam/hyparquet),
+pinned to 1.32.0 and loaded from jsDelivr), `data/fdc/<comid>.json`, and
+`data/src/<comid>.json` by relative URL. For local dev, copy the master table
+into `frontend/data/` (the copy is gitignored). Copy it again whenever the
+master table changes:
 
 ```powershell
-Copy-Item data\full_lhd_website.csv frontend\data\full_lhd_website.csv
+Copy-Item data\full_lhd_website.parquet frontend\data\full_lhd_website.parquet
 ```
 
 Then serve the site:
@@ -388,7 +390,7 @@ backend/
   lhd_processor/                  # hydraulics (solve_weir_geom) + data download
   arc_archive/                    # archived ARC pipeline (not used)
 data/
-  full_lhd_website.csv            # master dam CSV (read by site, written by pipeline)
+  full_lhd_website.parquet        # master dam table (read by site, written by pipeline)
 frontend/
   index.html, mapping-logic.js, hydraulics.js, css/
   data/                           # nwm_fdc.json, synthetic_rating_curves.json, fdc/, src/

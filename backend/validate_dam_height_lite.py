@@ -14,7 +14,7 @@ Usage
     python backend/validate_dam_height_lite.py
     python backend/validate_dam_height_lite.py \\
         --lite-csv output/dam_height_lite.csv \\
-        --dam-csv  data/full_lhd_website.csv \\
+        --dam-table data/full_lhd_website.parquet \\
         --out-dir  output/validation
 """
 from __future__ import annotations
@@ -25,6 +25,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Master dam table (Parquet) reader shared by every script.
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -32,7 +35,7 @@ from matplotlib.gridspec import GridSpec
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LITE = _REPO_ROOT / "output" / "dam_height_lite.csv"
-DEFAULT_CSV  = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_TABLE = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 DEFAULT_OUT  = _REPO_ROOT / "output" / "validation"
 
 FT_TO_M = 0.3048
@@ -41,9 +44,9 @@ FT_TO_M = 0.3048
 NID_PRIORITY = ["NID_Height_Ft", "Hydraulic_Height_Ft", "Structural_Height_Ft", "Dam_Height_Ft"]
 
 
-def load_and_join(lite_csv: Path, dam_csv: Path) -> pd.DataFrame:
-    lite = pd.read_csv(lite_csv)
-    dams = pd.read_csv(dam_csv, low_memory=False)
+def load_and_join(lite_csv: Path, dam_table: Path) -> pd.DataFrame:
+    lite = pd.read_csv(lite_csv)          # output of estimate_dam_height_lite.py (CSV)
+    dams = read_dam_table(dam_table)      # master dam table (Parquet)
 
     dams["OBJECTID"] = pd.to_numeric(dams["OBJECTID"], errors="coerce").astype("Int64")
     lite["OBJECTID"] = pd.to_numeric(lite["OBJECTID"], errors="coerce").astype("Int64")
@@ -212,7 +215,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lite-csv", type=Path, default=DEFAULT_LITE)
-    ap.add_argument("--dam-csv",  type=Path, default=DEFAULT_CSV)
+    # --dam-csv is kept as an old alias of --dam-table.
+    ap.add_argument("--dam-table", "--dam-csv", dest="dam_table", type=Path,
+                    default=DEFAULT_TABLE)
     ap.add_argument("--out-dir",  type=Path, default=DEFAULT_OUT)
     args = ap.parse_args()
 
@@ -220,7 +225,7 @@ def main() -> int:
         print(f"ERROR: {args.lite_csv} not found.\nRun estimate_dam_height_lite.py first.")
         return 1
 
-    df    = load_and_join(args.lite_csv, args.dam_csv)
+    df    = load_and_join(args.lite_csv, args.dam_table)
     stats = [
         compute_stats(df["dam_height_m"].values,     df["nid_height_m"].values, "lite vs NID"),
         compute_stats(df["dam_height_ARC_m"].values, df["nid_height_m"].values, "ARC  vs NID"),

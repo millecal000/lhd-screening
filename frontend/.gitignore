@@ -1,10 +1,12 @@
 *.DS_Store
 *.gpkg
 
-# Local-dev symlink to the canonical data/full_lhd_website.csv at repo root.
+# Local-dev copy of the canonical data/full_lhd_website.parquet at repo root.
 # The GitHub Pages workflow stages data/ into the published site so the
-# relative URL `data/full_lhd_website.csv` works in production without
-# needing this symlink. Create it locally so `python -m http.server` from
+# relative URL `data/full_lhd_website.parquet` works in production without
+# needing this copy. Create it locally so `python -m http.server` from
 # frontend/ also works:
-#   ln -s ../../data/full_lhd_website.csv frontend/data/full_lhd_website.csv
+#   Copy-Item data\full_lhd_website.parquet frontend\data\full_lhd_website.parquet
+data/full_lhd_website.parquet
+# Old CSV copy, from before the switch to Parquet.
 data/full_lhd_website.csv

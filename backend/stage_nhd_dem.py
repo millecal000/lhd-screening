@@ -20,7 +20,8 @@ Usage
     python backend/stage_nhd_dem.py --staging-dir /data/lhd_staging
 
 Optional flags
-    --dams-csv PATH       path to dam CSV  [default: data/full_lhd_website.csv]
+    --dams-table PATH     dam table (.parquet) [default: data/full_lhd_website.parquet]
+                          (--dams-csv is accepted as an older name for this option)
     --limit N             process only the first N dams (for smoke-testing)
     --force-flowlines     refetch NHD flowlines even if a cached .gpkg exists
     --force-tiles         re-download DEM tiles even if already on disk
@@ -53,9 +54,10 @@ from lhd_processor.download_geospatial_data import (
     query_dem_tiles,
     download_raw_tile,
 )
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table
 
 _REPO_ROOT = _BACKEND_ROOT.parent
-DEFAULT_DAMS_CSV = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_DAMS_TABLE = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 
 # NHD reach window: 1 km upstream, 1.5 km downstream
 _FLOWLINE_DISTANCE_KM = (1.0, 1.5)
@@ -441,7 +443,7 @@ def _apply_rename_map(
 
 def run_stage(
     staging_dir: Path,
-    dams_csv: Path,
+    dams_table: Path,
     *,
     limit: int | None = None,
     force_flowlines: bool = False,
@@ -462,7 +464,7 @@ def run_stage(
     flowline_dir.mkdir(parents=True, exist_ok=True)
     raw_dem_dir.mkdir(parents=True, exist_ok=True)
 
-    dams_df = pd.read_csv(dams_csv, encoding="latin-1")
+    dams_df = read_dam_table(dams_table)
     n_raw = len(dams_df)
     dams_df = dams_df[
         dams_df["OBJECTID"].notna()
@@ -476,7 +478,7 @@ def run_stage(
         dams_df = dams_df.head(limit)
 
     print(
-        f"Processing {len(dams_df)} dams from {dams_csv} "
+        f"Processing {len(dams_df)} dams from {dams_table} "
         f"(workers={workers}, download_workers={download_workers})\n"
     )
 
@@ -593,8 +595,8 @@ def main() -> None:
         help="Root directory where staged data will be written",
     )
     parser.add_argument(
-        "--dams-csv", type=Path, default=DEFAULT_DAMS_CSV,
-        help=f"Dam inventory CSV (default: {DEFAULT_DAMS_CSV})",
+        "--dams-table", "--dams-csv", dest="dams_table", type=Path, default=DEFAULT_DAMS_TABLE,
+        help=f"Dam table, .parquet (default: {DEFAULT_DAMS_TABLE})",
     )
     parser.add_argument(
         "--limit", type=int, default=None,
@@ -628,7 +630,7 @@ def main() -> None:
 
     run_stage(
         staging_dir=args.staging_dir,
-        dams_csv=args.dams_csv,
+        dams_table=args.dams_table,
         limit=args.limit,
         force_flowlines=args.force_flowlines,
         force_tiles=args.force_tiles,

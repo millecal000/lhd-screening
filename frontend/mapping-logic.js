@@ -985,17 +985,60 @@ window.updateActiveFiltersBadge = () => {
 };
 
 // 2. Load Dam Data
+// --- dam table loader (Parquet) ---
+// The dam table is data/full_lhd_website.parquet (it used to be a CSV read with
+// d3.csv). Parquet stores text as UTF-8 and is about 5x smaller. It is read in
+// the browser with hyparquet, a small dependency-free Parquet reader, pinned to
+// one version and loaded only when needed (this file is a classic script, so a
+// dynamic import() is used instead of an import statement).
+const HYPARQUET_URL = 'https://cdn.jsdelivr.net/npm/hyparquet@1.32.0/+esm';
+
+// One Parquet cell as the text d3.csv used to give, so the rest of this file
+// (parseFloat, parseInt, string checks) works unchanged:
+//   missing -> ''      whole-number columns arrive as BigInt -> '13080001'
+//   numbers -> String  (78840.0 becomes '78840'; parseFloat gives the same value)
+//   booleans -> 'True' / 'False' (how pandas wrote them in the CSV)
+function damCellToText(v) {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'bigint') return v.toString();
+    if (typeof v === 'number') {
+        if (Number.isNaN(v)) return '';
+        if (v === Infinity) return 'inf';
+        if (v === -Infinity) return '-inf';
+        return String(v);
+    }
+    if (typeof v === 'boolean') return v ? 'True' : 'False';
+    if (v instanceof Date) return v.toISOString();
+    return String(v);
+}
+
+// Fetch the whole Parquet file (about 2 MB) and return one plain object per dam,
+// keyed by column name with text values, like d3.csv returned.
+async function loadDamTable(url) {
+    const { parquetReadObjects } = await import(HYPARQUET_URL);
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} loading ${url}`);
+    const file = await resp.arrayBuffer();
+    const rows = await parquetReadObjects({ file });
+    return rows.map(r => {
+        const out = {};
+        for (const k of Object.keys(r)) out[k] = damCellToText(r[k]);
+        return out;
+    });
+}
+// --- end dam table loader ---
+
 async function loadDams() {
     try {
         // Append a timestamp to the URL to force the browser to bypass its cache. This ensures that users always get the most up-to-date data without needing to manually clear their cache. In development, this is crucial to see changes immediately. In production, it guarantees that any updates to the dam data are reflected for all users without delay.
-        allDams = await d3.csv(`data/full_lhd_website.csv?v=${new Date().getTime()}`);
+        allDams = await loadDamTable(`data/full_lhd_website.parquet?v=${new Date().getTime()}`);
         // NWM does not produce forecasts for Hawaii or Puerto Rico, so exclude those dams everywhere.
         const NON_CONUS_STATES = new Set(['HI', 'PR']);
         allDams = allDams.filter(d => !NON_CONUS_STATES.has((d['State Abbreviation'] || '').toUpperCase()));
         renderMarkers();
         console.log("Dam markers clustered and initialized.");
     } catch (err) { 
-        console.error("Error loading CSV:", err); 
+        console.error("Error loading the dam table (Parquet):", err); 
     }
 }
 

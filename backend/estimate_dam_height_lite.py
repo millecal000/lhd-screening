@@ -59,6 +59,9 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+# Master dam table (Parquet) reader shared by every script.
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table
 import geopandas as gpd
 import rasterio
 import rasterio.merge
@@ -79,7 +82,7 @@ from lhd_processor.download_geospatial_data import (
 )
 
 _REPO_ROOT = _BACKEND_ROOT.parent
-DEFAULT_CSV     = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_TABLE   = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 DEFAULT_OUT     = _REPO_ROOT / "output" / "dam_height_lite.csv"
 DEFAULT_CACHE   = _BACKEND_ROOT / "cache"
 HYDROFABRIC_PKL = DEFAULT_CACHE / "riverml_channel_geometry_with_ahg.parquet"
@@ -1013,7 +1016,9 @@ def process_dam(
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv",         type=Path,   default=DEFAULT_CSV)
+    # --csv is kept as an old alias of --table so existing commands still parse.
+    ap.add_argument("--table", "--csv", dest="table", type=Path, default=DEFAULT_TABLE,
+                    help="Master dam table (.parquet) [default: data/full_lhd_website.parquet]")
     ap.add_argument("--output-csv",  type=Path,   default=DEFAULT_OUT)
     ap.add_argument("--staging-dir", type=Path,   default=None,
                     help="Root of an existing ARC staging tree (reuses STRM/ and DEM/)")
@@ -1024,11 +1029,11 @@ def main() -> int:
                     help="Specific OBJECTIDs to process (overrides --limit)")
     args = ap.parse_args()
 
-    if not args.csv.exists():
-        _log(f"ERROR: {args.csv} not found"); return 1
+    if not args.table.exists():
+        _log(f"ERROR: {args.table} not found"); return 1
 
-    _log(f"Loading {args.csv} …")
-    df = pd.read_csv(args.csv, low_memory=False)
+    _log(f"Loading {args.table} …")
+    df = read_dam_table(args.table)
     df["OBJECTID"] = pd.to_numeric(df["OBJECTID"], errors="coerce").astype("Int64")
 
     if args.objectids:

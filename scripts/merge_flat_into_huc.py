@@ -3,7 +3,7 @@
 (huc<level>_<KEY>/<sub>/<dam_id>/) under the new staging root.
 
 For each <sub>/<dam_id>/ in the flat dir:
-  - look up HUC8 in the master CSV, derive the batch key at --huc-level
+  - look up HUC8 in the master dam table, derive the batch key at --huc-level
   - move the dir into <new-root>/huc<level>_<key>/<sub>/<dam_id>/
   - if the target slot is already a symlink (the existing-data-dir flow),
     unlink first, then move
@@ -23,6 +23,10 @@ from typing import Dict, List, Tuple
 
 import pandas as pd
 
+# Make backend/ importable so this script uses the shared dam-table module.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table  # noqa: E402
+
 _REUSE_SUBDIRS = ("DEM", "STRM", "LAND", "FLOW", "RESULTS")
 
 
@@ -30,10 +34,10 @@ def _huc_dirname(key: str) -> str:
     return f"huc{len(key)}_{key}"
 
 
-def _load_dam_to_key(dams_csv: Path, huc_level: int) -> Dict[int, str]:
-    df = pd.read_csv(dams_csv, low_memory=False, encoding="latin-1")
+def _load_dam_to_key(dams_table: Path, huc_level: int) -> Dict[int, str]:
+    df = read_dam_table(dams_table)
     if "HUC8" not in df.columns:
-        sys.exit(f"{dams_csv} has no HUC8 column. Run backend/assign_huc8.py first.")
+        sys.exit(f"{dams_table} has no HUC8 column. Run backend/assign_huc8.py first.")
     df = df.dropna(subset=["OBJECTID", "HUC8"])
     df["OBJECTID"] = df["OBJECTID"].astype(int)
     df["HUC8"] = df["HUC8"].astype(str).str.split(".").str[0].str.zfill(8)
@@ -154,8 +158,9 @@ def main() -> None:
                    help="Old staging dir with DEM/STRM/LAND/FLOW/RESULTS subdirs")
     p.add_argument("--new-root", type=Path, required=True,
                    help="New staging root containing huc<level>_<KEY>/ bundles")
-    p.add_argument("--dams-csv", type=Path,
-                   default=Path(__file__).resolve().parents[1] / "data" / "full_lhd_website.csv")
+    # --dams-csv is kept as an old alias of --dams-table.
+    p.add_argument("--dams-table", "--dams-csv", dest="dams_table", type=Path,
+                   default=DEFAULT_DAM_TABLE)
     p.add_argument("--huc-level", type=int, choices=[2, 4, 6, 8], default=6)
     p.add_argument("--apply", action="store_true",
                    help="Actually move files. Without this, prints a dry-run plan.")
@@ -165,10 +170,10 @@ def main() -> None:
         sys.exit(f"--flat-dir not found: {args.flat_dir}")
     if not args.new_root.is_dir():
         sys.exit(f"--new-root not found: {args.new_root}")
-    if not args.dams_csv.exists():
-        sys.exit(f"--dams-csv not found: {args.dams_csv}")
+    if not args.dams_table.exists():
+        sys.exit(f"--dams-table not found: {args.dams_table}")
 
-    dam_to_key = _load_dam_to_key(args.dams_csv, args.huc_level)
+    dam_to_key = _load_dam_to_key(args.dams_table, args.huc_level)
     moves, skip = _plan_moves(args.flat_dir, args.new_root, dam_to_key)
 
     by_bundle: Dict[str, int] = {}

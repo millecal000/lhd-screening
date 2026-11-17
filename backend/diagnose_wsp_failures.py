@@ -12,7 +12,7 @@ Usage
 -----
     python backend/diagnose_wsp_failures.py \\
         --staging-root /data/lhd_wsp \\
-        [--dams-csv data/full_lhd_website.csv] \\
+        [--dams-table data/full_lhd_website.parquet] \\
         [--output-csv /data/lhd_wsp/wsp_failures.csv] \\
         [--failures-only]
 """
@@ -27,9 +27,12 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+# Master dam table (Parquet) reader shared by every script.
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table
+
 _BACKEND_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT    = _BACKEND_ROOT.parent
-DEFAULT_CSV   = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_TABLE = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 
 _HUC_DIR_RE = re.compile(r"^huc\d+_")
 
@@ -195,8 +198,10 @@ def main() -> None:
     )
     parser.add_argument("--staging-root", type=Path, required=True,
                         help="Parent dir containing huc<N>_<KEY>/ subdirs")
-    parser.add_argument("--dams-csv", type=Path, default=DEFAULT_CSV,
-                        help=f"Master dam CSV for metadata [default: {DEFAULT_CSV}]")
+    # --dams-csv is kept as an old alias of --dams-table.
+    parser.add_argument("--dams-table", "--dams-csv", dest="dams_table", type=Path,
+                        default=DEFAULT_TABLE,
+                        help=f"Master dam table (.parquet) for metadata [default: {DEFAULT_TABLE}]")
     parser.add_argument("--output-csv", type=Path, default=None,
                         help="Where to write the per-dam CSV "
                              "[default: <staging-root>/wsp_failures.csv]")
@@ -207,17 +212,19 @@ def main() -> None:
     df = _scan(args.staging_root, args.failures_only)
 
     # Join master CSV metadata
-    if args.dams_csv.exists():
+    if args.dams_table.exists():
         meta_cols = ["OBJECTID", "Dam_Name", "State", "HUC8", "Reach_ID"]
-        _hdr = pd.read_csv(args.dams_csv, nrows=0, encoding="latin-1").columns
-        meta = pd.read_csv(args.dams_csv, low_memory=False, encoding="latin-1",
-                           usecols=[c for c in meta_cols if c in _hdr])
+        # Column names come from the Parquet footer, no data is read for this.
+        import pyarrow.parquet as _pq
+        _hdr = _pq.ParquetFile(args.dams_table).schema_arrow.names
+        meta = read_dam_table(args.dams_table,
+                              columns=[c for c in meta_cols if c in _hdr])
         meta = meta.rename(columns={"OBJECTID": "dam_id"})
         meta["dam_id"] = pd.to_numeric(meta["dam_id"], errors="coerce").astype("Int64")
         df["dam_id"] = df["dam_id"].astype("Int64")
         df = df.merge(meta, on="dam_id", how="left")
     else:
-        print(f"  WARN: dams CSV not found at {args.dams_csv} — skipping metadata join")
+        print(f"  WARN: dam table not found at {args.dams_table} — skipping metadata join")
 
     # Column order
     front = ["dam_id", "Dam_Name", "State", "HUC8", "huc_key",

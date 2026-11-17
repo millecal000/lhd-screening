@@ -3,7 +3,7 @@ Compare WSP-derived dam height and length against NID reference values.
 
 Usage:
     python backend/analyze_wsp_predictions.py
-    python backend/analyze_wsp_predictions.py --csv data/full_lhd_website.csv \
+    python backend/analyze_wsp_predictions.py --table data/full_lhd_website.parquet \
         --out output/wsp_validation.png
 """
 from __future__ import annotations
@@ -15,10 +15,13 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
 import pandas as pd
+
+# Master dam table (Parquet) reader shared by every script.
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table
 from scipy import stats
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CSV = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_TABLE = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 DEFAULT_OUT = _REPO_ROOT / "output" / "wsp_validation.png"
 
 
@@ -90,7 +93,9 @@ def residual_panel(ax, obs, pred, unit, color, cap=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
+    # --csv is kept as an old alias of --table so existing commands still parse.
+    parser.add_argument("--table", "--csv", dest="table", type=Path, default=DEFAULT_TABLE,
+                        help="Master dam table (.parquet) [default: data/full_lhd_website.parquet]")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--height-cap", type=float, default=100,
                         help="Cap NID height at this value for zoomed panels (ft)")
@@ -98,7 +103,7 @@ def main():
                         help="Cap NID length at this value for zoomed panels (ft)")
     args = parser.parse_args()
 
-    df = pd.read_csv(args.csv, low_memory=False, encoding="latin-1")
+    df = read_dam_table(args.table)
 
     # Height: use NID_Height_Ft (most paired rows)
     h = df[["NID_Height_Ft", "Dam_Height_WSP_Ft"]].dropna()

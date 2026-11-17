@@ -1,6 +1,6 @@
 """
 Build synthetic stage-vs-discharge rating curves (SRC) for every dam's NHDPlus V2
-reach (Reach_ID / COMID) in full_lhd_website.csv.
+reach (Reach_ID / COMID) in data/full_lhd_website.parquet.
 
 Primary method — AHG (at-a-station hydraulic geometry):
     depth  = y_coef * Q^y_exp
@@ -20,7 +20,7 @@ Source: s3://lynker-spatial/tabular/riverml_channel_geometry_with_ahg.parquet
 
 Usage:
     python backend/build_synthetic_rating_curves.py
-    python backend/build_synthetic_rating_curves.py --csv data/full_lhd_website.csv \
+    python backend/build_synthetic_rating_curves.py --table data/full_lhd_website.parquet \
         --out frontend/data/synthetic_rating_curves.json
 """
 from __future__ import annotations
@@ -32,6 +32,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Master dam table (Parquet) reader shared by every script.
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table
 import pyarrow.parquet as pq
 import s3fs
 
@@ -41,7 +44,7 @@ _REPO_ROOT = _BACKEND_ROOT.parent
 _PARQUET_URL = "lynker-spatial/tabular/riverml_channel_geometry_with_ahg.parquet"
 _CACHE_PATH = _BACKEND_ROOT / "cache" / "riverml_channel_geometry_with_ahg.parquet"
 
-DEFAULT_CSV = _REPO_ROOT / "data" / "full_lhd_website.csv"
+DEFAULT_TABLE = DEFAULT_DAM_TABLE  # data/full_lhd_website.parquet
 DEFAULT_OUT = _REPO_ROOT / "frontend" / "data" / "synthetic_rating_curves.json"
 
 _N_CURVE_POINTS = 60
@@ -166,7 +169,9 @@ def _trapezoid_rating_curve(row: pd.Series) -> dict | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv",          type=Path, default=DEFAULT_CSV)
+    # --csv is kept as an old alias of --table so existing commands still parse.
+    ap.add_argument("--table", "--csv", dest="table", type=Path, default=DEFAULT_TABLE,
+                    help="Master dam table (.parquet) [default: data/full_lhd_website.parquet]")
     ap.add_argument("--out",          type=Path, default=DEFAULT_OUT)
     ap.add_argument("--split-dir",    type=Path,
                     default=DEFAULT_OUT.parent / "src",
@@ -176,8 +181,8 @@ def main() -> int:
     ap.add_argument("--force-download", action="store_true")
     args = ap.parse_args()
 
-    if not args.csv.exists():
-        _log(f"ERROR: {args.csv} not found"); return 1
+    if not args.table.exists():
+        _log(f"ERROR: {args.table} not found"); return 1
 
     # Load FDC for Q_max per ComID (p100 = index 12 in the 13-value array)
     fdc: dict = {}
@@ -191,8 +196,8 @@ def main() -> int:
     else:
         _log(f"WARNING: {args.fdc} not found — Q_max will use 20×Q_bf fallback")
 
-    _log(f"Loading {args.csv} ...")
-    df = pd.read_csv(args.csv, low_memory=False, encoding="latin-1")
+    _log(f"Loading {args.table} ...")
+    df = read_dam_table(args.table)
     reach_ids   = pd.to_numeric(df["Reach_ID"], errors="coerce").dropna().astype(int)
     feature_ids = set(reach_ids.unique().tolist())
     _log(f"{len(feature_ids)} unique Reach_ID/COMID values across {len(df)} dams")

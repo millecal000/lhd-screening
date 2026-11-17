@@ -14,7 +14,9 @@ Also drops ARC-only columns that are no longer used:
 Incremental: dams that already have Qmin_env are skipped, so each
 pipeline batch only solves newly-added dams.
 
-Writes to both data/full_lhd_website.csv and frontend/data/full_lhd_website.csv.
+Reads and writes the dam table, data/full_lhd_website.parquet (or the table
+given with --table). The website reads that same file directly, so no
+separate frontend copy is written any more.
 
 Usage
 -----
@@ -39,10 +41,10 @@ if str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
 from lhd_processor.hydraulics import weir_H_simp, calc_y2_simp, compute_y_flip_adv
+from lhd_processor.dam_table import DEFAULT_DAM_TABLE, read_dam_table, write_dam_table
 
 FT_TO_M      = 1.0 / 3.28084
-DEFAULT_CSV  = _REPO_ROOT / "data"          / "full_lhd_website.csv"
-FRONTEND_CSV = _REPO_ROOT / "frontend/data" / "full_lhd_website.csv"
+DEFAULT_TABLE = DEFAULT_DAM_TABLE   # data/full_lhd_website.parquet
 SRC_JSON     = _REPO_ROOT / "frontend/data" / "synthetic_rating_curves.json"
 
 ARC_COLS = [
@@ -81,17 +83,17 @@ def _danger_range_from_src(
 
 
 def run(
-    csv_path: Path = DEFAULT_CSV,
+    table_path: Path = DEFAULT_TABLE,
     src_data: dict | None = None,
     dry_run: bool = False,
 ) -> None:
-    """Compute NWM-based Qmin_env/Qmax_env and write back to csv_path.
+    """Compute NWM-based Qmin_env/Qmax_env and write back to table_path (.parquet).
 
     Incremental: dams that already have a Qmin_env value are skipped.
     src_data: pre-loaded synthetic_rating_curves.json dict. If None, loads
     from SRC_JSON (avoids re-reading 11 MB per HUC batch when called in a loop).
     """
-    df = pd.read_csv(csv_path, low_memory=False, encoding="latin-1")
+    df = read_dam_table(table_path)
 
     if src_data is None:
         with open(SRC_JSON) as f:
@@ -155,21 +157,18 @@ def run(
     df.loc[list(q_mins.keys()), "Qmin_env"] = list(q_mins.values())
     df.loc[list(q_maxs.keys()), "Qmax_env"] = list(q_maxs.values())
 
-    df.to_csv(csv_path, index=False)
-    print(f"Wrote {csv_path}")
-
-    if FRONTEND_CSV.resolve() != csv_path.resolve() and FRONTEND_CSV.exists():
-        df.to_csv(FRONTEND_CSV, index=False)
-        print(f"Wrote {FRONTEND_CSV}")
+    write_dam_table(df, table_path)
+    print(f"Wrote {table_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
+    parser.add_argument("--table", "--csv", dest="table", type=Path, default=DEFAULT_TABLE,
+                        help="Dam table (.parquet) [default: %(default)s]; --csv is an older name")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    run(csv_path=args.csv, dry_run=args.dry_run)
+    run(table_path=args.table, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
